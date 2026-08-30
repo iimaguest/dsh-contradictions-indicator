@@ -33,7 +33,8 @@
     "lib/types/**/*.d.ts",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "license": "Apache-2.0",
   "author": "iimaguest",
