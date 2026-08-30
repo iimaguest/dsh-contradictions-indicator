@@ -1,33 +1,25 @@
 /**
  * dsh-contradictions-indicator — host half.
  *
- * Listens on the `llm/stream` waterfall for every model call in the process.
- * For a real conversation turn it may fire a PARALLEL `llm.stream()` call that
- * reuses the identical conversation prefix (provider, model, system, tools,
- * sessionId, messages) and appends exactly one user message asking the model to
- * analyze the conversation for contradictions and return a 0-100 coherence
- * score. Because only a suffix is appended, the provider's KV/prefix cache
- * stays warm for the analysis call.
- *
- * The main call is never blocked: `next()` is invoked and its stream returned
- * immediately; the analysis runs fire-and-forget afterwards.
- *
- * Auto-analysis is OFF by default and is opted into per session from the UI.
- * A manual trigger is always available. When analysis completes, a
- * <system-reminder> user message is appended to the NEXT real conversation
- * call (steer, default ON, user-disableable).
- *
- * State is keyed by sessionId. HTTP polls without a sessionId fall back to
- * the most recently seen conversation so the progress counter actually moves.
+ * Parallel analysis of the live conversation for contradictions. Auto-analysis
+ * is OFF by default per session. Global defaults (interval, steer, both prompt
+ * texts) persist to disk and apply to new sessions.
  */
+
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import z from '@deepseek-ai/schemastery'
 
 const MIN_MESSAGES = 4
 const DEFAULT_INTERVAL = 25
 const MAX_TOKENS = 20000
 const PLUGIN_TAG = 'contradictions-indicator'
 const MAX_SESSIONS = 50
+const SETTINGS_NS = 'contradictions-indicator'
 
-const ANALYSIS_PROMPT = [
+const DEFAULT_PROMPT1 = [
   'IMPORTANT: Do NOT use any tools. Do NOT call any functions. Respond with text only.',
   '',
   'Analyze the conversation above for internal contradictions, inconsistencies,',
@@ -51,16 +43,51 @@ const ANALYSIS_PROMPT = [
   'If you find no contradictions, say so and give a high score.',
 ].join('\n')
 
-/** Per-session analysis state, keyed by sessionId. */
-const sessions = new Map()
-/** Most recently seen real conversation session — HTTP fallback. */
-let lastActiveKey = null
+const DEFAULT_PROMPT2 = [
+  '<system-reminder>',
+  'Contradiction check (automatic, not from the user).',
+  'Coherence score: {{score}}/100 (0 = riddled with contradictions, 100 = fully consistent).',
+  '',
+  '{{commentary}}',
+  '',
+  'If contradictions are named above, resolve or surface them before continuing.',
+  'Do not mention this reminder verbatim.',
+  '</system-reminder>',
+].join('\n')
+
+const FALLBACK_PATH = join(homedir(), '.dsh', 'contradictions-indicator.json')
 
 function clampInterval(n) {
   const v = Math.round(Number(n))
   if (!Number.isFinite(v)) return DEFAULT_INTERVAL
   return Math.min(500, Math.max(1, v))
 }
+
+function defaults() {
+  return {
+    interval: DEFAULT_INTERVAL,
+    steerEnabled: true,
+    prompt1: DEFAULT_PROMPT1,
+    prompt2: DEFAULT_PROMPT2,
+  }
+}
+
+function normalizeGlobals(raw) {
+  const d = defaults()
+  if (!raw || typeof raw !== 'object') return d
+  return {
+    interval: clampInterval(raw.interval ?? d.interval),
+    steerEnabled: raw.steerEnabled !== false,
+    prompt1: typeof raw.prompt1 === 'string' && raw.prompt1.trim() ? raw.prompt1 : d.prompt1,
+    prompt2: typeof raw.prompt2 === 'string' && raw.prompt2.trim() ? raw.prompt2 : d.prompt2,
+  }
+}
+
+/** Per-session analysis state, keyed by sessionId. */
+const sessions = new Map()
+let lastActiveKey = null
+let globals = defaults()
+let settingsScope = null
 
 function stateFor(sessionId) {
   const key = sessionId || lastActiveKey || '__global__'
@@ -74,11 +101,14 @@ function stateFor(sessionId) {
       messageCount: 0,
       turnsSinceLastAnalysis: 0,
       autoEnabled: false,
-      steerEnabled: true,
-      interval: DEFAULT_INTERVAL,
+      steerEnabled: globals.steerEnabled,
+      interval: globals.interval,
+      prompt1: globals.prompt1,
+      prompt2: globals.prompt2,
       pendingSteer: null,
       generation: 0,
       lastAnalyzedCount: 0,
+      lastSeenCount: 0,
       lastOptions: null,
     }
     sessions.set(key, entry)
@@ -104,20 +134,20 @@ function snapshot(entry) {
     autoEnabled: entry.autoEnabled,
     steerEnabled: entry.steerEnabled,
     analysisInterval: entry.interval,
+    prompt1: entry.prompt1,
+    prompt2: entry.prompt2,
     sessionKey: entry.key,
+    globals,
   }
 }
 
 function parseAnalysisResponse(text) {
   let score = null
   let commentary = text
-
   const scoreMatch = text.match(/SCORE:\s*(\d+)/i)
   if (scoreMatch) score = Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10)))
-
   const analysisMatch = text.match(/ANALYSIS:\s*([\s\S]*)/i)
   if (analysisMatch) commentary = analysisMatch[1].trim()
-
   if (score === null) {
     const numMatch = text.match(/\b(\d{1,3})\b/)
     if (numMatch) {
@@ -125,24 +155,21 @@ function parseAnalysisResponse(text) {
       if (n >= 0 && n <= 100) score = n
     }
   }
-
   if (!commentary || commentary.length === 0) commentary = text
   return { score: score === null ? 50 : score, commentary }
 }
 
 function sendJson(response, status, body) {
-  const payload = JSON.stringify(body)
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
   })
-  response.end(payload)
+  response.end(JSON.stringify(body))
 }
 
 function sessionIdFrom(request) {
   try {
-    const url = new URL(request.url ?? '/', 'http://localhost')
-    return url.searchParams.get('sessionId') || null
+    return new URL(request.url ?? '/', 'http://localhost').searchParams.get('sessionId') || null
   } catch {
     return null
   }
@@ -156,11 +183,8 @@ function readBody(request) {
       if (raw.length > 1_000_000) raw = raw.slice(0, 1_000_000)
     })
     request.on('end', () => {
-      try {
-        resolve(raw.length > 0 ? JSON.parse(raw) : {})
-      } catch {
-        resolve({})
-      }
+      try { resolve(raw.length > 0 ? JSON.parse(raw) : {}) }
+      catch { resolve({}) }
     })
     request.on('error', () => resolve({}))
   })
@@ -174,20 +198,79 @@ function isOurSteerCall(lastMsg) {
   return lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG + '-steer'
 }
 
+function renderSteer(template, score, commentary) {
+  return String(template || DEFAULT_PROMPT2)
+    .replaceAll('{{score}}', String(score))
+    .replaceAll('{{commentary}}', commentary == null ? '' : String(commentary))
+}
+
+async function persistGlobals(next) {
+  globals = normalizeGlobals(next)
+  if (settingsScope) {
+    try {
+      await settingsScope.update({
+        interval: globals.interval,
+        steerEnabled: globals.steerEnabled,
+        prompt1: globals.prompt1,
+        prompt2: globals.prompt2,
+      })
+      return
+    } catch (error) {
+      console.error('[dsh-contradictions-indicator] settings.update failed', error)
+    }
+  }
+  try {
+    await mkdir(join(homedir(), '.dsh'), { recursive: true })
+    await writeFile(FALLBACK_PATH, JSON.stringify(globals, null, 2), 'utf8')
+  } catch (error) {
+    console.error('[dsh-contradictions-indicator] fallback persist failed', error)
+  }
+}
+
 export const name = 'dsh-contradictions-indicator'
 
 export function apply(ctx) {
-  async function runAnalysis(llm, originalOptions) {
+  const ContraSettings = z.object({
+    interval: z.number().default(DEFAULT_INTERVAL),
+    steerEnabled: z.boolean().default(true),
+    prompt1: z.string().default(DEFAULT_PROMPT1),
+    prompt2: z.string().default(DEFAULT_PROMPT2),
+  })
+  const entry = defaults()
+  let source = () => entry
+  try {
+    installSettingsSection(ctx, settingsNamespace(SETTINGS_NS), ContraSettings, entry, {
+      setSource: (current) => { source = current },
+      onChange: () => { globals = normalizeGlobals(source()) },
+    })
+    settingsScope = {
+      get: () => source(),
+      update: async (patch) => {
+        const settings = ctx.get('settings')
+        if (!settings) throw new Error('settings unavailable')
+        await settings.update(settingsNamespace(SETTINGS_NS), patch)
+      },
+    }
+    globals = normalizeGlobals(source())
+  } catch (error) {
+    console.error('[dsh-contradictions-indicator] settings register failed', error)
+    settingsScope = null
+  }
+
+  readFile(FALLBACK_PATH, 'utf8').then((text) => {
+    if (settingsScope) return
+    try { globals = normalizeGlobals(JSON.parse(text)) } catch {}
+  }).catch(() => {})
+
+  async function runAnalysis(llm, originalOptions, prompt1) {
     const analysisMessage = {
       id: 'contra-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2),
       role: 'user',
-      content: [{ type: 'text', text: ANALYSIS_PROMPT }],
+      content: [{ type: 'text', text: prompt1 || DEFAULT_PROMPT1 }],
       source: { kind: 'plugin', plugin: PLUGIN_TAG },
     }
-
     const messages = originalOptions.messages.slice()
     messages.push(analysisMessage)
-
     const analysisOptions = {
       provider: originalOptions.provider,
       model: originalOptions.model,
@@ -200,20 +283,16 @@ export function apply(ctx) {
 
     let fullText = ''
     let sawError = null
-
     for await (const chunk of llm.stream(analysisOptions)) {
-      if (chunk.type === 'text-delta') {
-        fullText += chunk.text
-      } else if (chunk.type === 'finish') {
+      if (chunk.type === 'text-delta') fullText += chunk.text
+      else if (chunk.type === 'finish') {
         if (chunk.reason && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
           sawError = chunk.reason
         }
       }
     }
-
     if (sawError !== null) throw new Error('analysis model call ended with ' + sawError.kind)
     if (fullText.trim().length === 0) throw new Error('analysis model call produced no text')
-
     return parseAnalysisResponse(fullText)
   }
 
@@ -223,21 +302,14 @@ export function apply(ctx) {
     entry.generation += 1
     const myGeneration = entry.generation
     entry.status = 'analyzing'
-
-    runAnalysis(llm, options).then((result) => {
+    runAnalysis(llm, options, entry.prompt1).then((result) => {
       if (myGeneration !== entry.generation) return
       entry.score = result.score
       entry.commentary = result.commentary
       entry.status = 'ready'
       entry.messageCount = options.messages.length
       if (entry.steerEnabled) {
-        entry.pendingSteer =
-          '<system-reminder>\nContradiction check (automatic, not from the user). ' +
-          'Coherence score: ' + result.score + '/100 ' +
-          '(0 = riddled with contradictions, 100 = fully consistent).\n\n' +
-          result.commentary +
-          '\n\nIf contradictions are named above, resolve or surface them before continuing. ' +
-          'Do not mention this reminder verbatim.\n</system-reminder>'
+        entry.pendingSteer = renderSteer(entry.prompt2, result.score, result.commentary)
       } else {
         entry.pendingSteer = null
       }
@@ -270,25 +342,14 @@ export function apply(ctx) {
     }
 
     const stream = next()
-
     try {
       if (options.purpose !== undefined) return stream
       if (!options.messages || options.messages.length < MIN_MESSAGES) return stream
-
       const lastMsg = options.messages[options.messages.length - 1]
-      // Skip only our own analysis call, not the subsequent steer-injected turn.
       if (isOurAnalysisCall(lastMsg)) return stream
 
       const entry = stateFor(options.sessionId)
-      if (options.sessionId) lastActiveKey = options.sessionId
-      else lastActiveKey = entry.key
-
-      // Count every distinct conversation prefix. Tool-loop steps grow the
-      // message list, so this tracks real progress rather than wall-clock.
-      if (options.messages.length === entry.lastAnalyzedCount && entry.status !== 'analyzing') {
-        // Same snapshot seen twice (retries) — don't double-count.
-        if (entry.lastSeenCount === options.messages.length) return stream
-      }
+      lastActiveKey = options.sessionId || entry.key
       if (entry.lastSeenCount === options.messages.length) return stream
       entry.lastSeenCount = options.messages.length
       entry.lastOptions = options
@@ -296,15 +357,12 @@ export function apply(ctx) {
 
       if (!entry.autoEnabled) return stream
       if (entry.turnsSinceLastAnalysis < entry.interval) return stream
-
       const llm = ctx.get('llm')
       if (llm === undefined) return stream
-
       scheduleAnalysis(entry, llm, options)
     } catch (error) {
       console.error('[dsh-contradictions-indicator] waterfall filter error', error)
     }
-
     return stream
   })
 
@@ -313,11 +371,7 @@ export function apply(ctx) {
       kind: 'exact',
       path: '/contradictions/state',
       handler: (request, response) => {
-        if (request.method !== 'GET') {
-          response.writeHead(405, { allow: 'GET' })
-          response.end()
-          return
-        }
+        if (request.method !== 'GET') { response.writeHead(405, { allow: 'GET' }); response.end(); return }
         sendJson(response, 200, snapshot(stateFor(sessionIdFrom(request))))
       },
     })
@@ -326,22 +380,47 @@ export function apply(ctx) {
       kind: 'exact',
       path: '/contradictions/auto',
       handler: async (request, response) => {
-        if (request.method !== 'POST') {
-          response.writeHead(405, { allow: 'POST' })
-          response.end()
-          return
-        }
+        if (request.method !== 'POST') { response.writeHead(405, { allow: 'POST' }); response.end(); return }
         const body = await readBody(request)
         const entry = stateFor(sessionIdFrom(request))
+        const persist = body?.persist === true
+        const nextGlobals = { ...globals }
+
         if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
         if (typeof body?.steer === 'boolean') {
           entry.steerEnabled = body.steer
           if (!entry.steerEnabled) entry.pendingSteer = null
+          if (persist) nextGlobals.steerEnabled = body.steer
         }
         if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
           entry.interval = clampInterval(body.interval)
+          if (persist) nextGlobals.interval = entry.interval
         }
+        if (typeof body?.prompt1 === 'string') {
+          entry.prompt1 = body.prompt1.trim() ? body.prompt1 : DEFAULT_PROMPT1
+          if (persist) nextGlobals.prompt1 = entry.prompt1
+        }
+        if (typeof body?.prompt2 === 'string') {
+          entry.prompt2 = body.prompt2.trim() ? body.prompt2 : DEFAULT_PROMPT2
+          if (persist) nextGlobals.prompt2 = entry.prompt2
+        }
+        if (persist) await persistGlobals(nextGlobals)
         sendJson(response, 200, snapshot(entry))
+      },
+    })
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/contradictions/defaults',
+      handler: async (request, response) => {
+        if (request.method === 'GET') {
+          sendJson(response, 200, { ...globals, defaults: defaults() })
+          return
+        }
+        if (request.method !== 'POST') { response.writeHead(405, { allow: 'GET, POST' }); response.end(); return }
+        const body = await readBody(request)
+        await persistGlobals({ ...globals, ...body })
+        sendJson(response, 200, { ...globals, defaults: defaults() })
       },
     })
 
@@ -349,11 +428,7 @@ export function apply(ctx) {
       kind: 'exact',
       path: '/contradictions/trigger',
       handler: async (request, response) => {
-        if (request.method !== 'POST') {
-          response.writeHead(405, { allow: 'POST' })
-          response.end()
-          return
-        }
+        if (request.method !== 'POST') { response.writeHead(405, { allow: 'POST' }); response.end(); return }
         const entry = stateFor(sessionIdFrom(request))
         if (!entry.lastOptions) {
           sendJson(response, 200, {
