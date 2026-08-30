@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Inject next-turn steer on `agent/pre-step` instead of mutating frozen `llm/stream` options, so the reminder actually reaches the model.
+
 ## 1.0.0
 
 - Host plugin watches conversation `llm/stream` calls and runs parallel contradiction analysis.

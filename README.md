@@ -31,7 +31,7 @@ Requires DSH web with the settings and conversation UI packages that this plugin
 - Parses `SCORE: <n>` and `ANALYSIS: <text>` from that response.
 - Shows a colored header badge (green ≥80, yellow ≥50, red &lt;50) and an overlay with the commentary.
 - Auto-analysis is off per session until you enable it. Default interval is 25 turns (editable, 1–500).
-- Optional next-turn system-reminder steer using `{{score}}` and `{{commentary}}`. Off for the analysis itself if you uncheck it.
+- Optional next-turn system-reminder steer using `{{score}}` and `{{commentary}}`. Injected on `agent/pre-step` (not by mutating frozen `llm/stream` options). Off for the analysis itself if you uncheck it.
 - Global interval, steer default, and both prompt texts persist via DSH settings (with a file fallback at `~/.dsh/contradictions-indicator.json`).
 
 ## HTTP endpoints (local DSH web server)
