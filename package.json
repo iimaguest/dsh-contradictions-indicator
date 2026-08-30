@@ -32,9 +32,19 @@
     "lib/**/*.js",
     "lib/types/**/*.d.ts",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
+  "author": "iimaguest",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iimaguest/dsh-contradictions-indicator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iimaguest/dsh-contradictions-indicator/issues"
+  },
+  "homepage": "https://github.com/iimaguest/dsh-contradictions-indicator#readme",
   "keywords": [
     "dsh",
     "deepseek-harness",

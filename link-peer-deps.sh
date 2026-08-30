@@ -1,13 +1,13 @@
 #!/bin/sh
-# Link the @deepseek-ai peer dependencies into package/node_modules so the
+# Link the @deepseek-ai peer dependencies into ./node_modules so the
 # plugin's bare imports resolve when dsh loads it from this directory.
 #
-# The profile installs this plugin with a `link:` dependency pointing at
-# ./package. Node resolves imports from the REAL path (symlinks are
-# followed), so it never walks through the profile's node_modules where the
-# dsh host provides its packages. Regular profile plugins resolve peers from
+# A profile may install this plugin with a `link:` dependency. Node
+# resolves imports from the REAL path (symlinks are followed), so it
+# never walks through the profile's node_modules where the dsh host
+# provides its packages. Regular profile plugins resolve peers from
 # ~/.dsh/profiles/node_modules/@deepseek-ai/; this script makes the same
-# instances visible from ./package by symlinking them in.
+# instances visible from this repo by symlinking them in.
 #
 # node_modules/ is gitignored — re-run this after a fresh clone.
 
@@ -23,10 +23,10 @@ for pkg in $PEERS; do
   fi
 done
 
-mkdir -p package/node_modules/@deepseek-ai
+mkdir -p node_modules/@deepseek-ai
 for pkg in $PEERS; do
-  ln -sfn "$PEERS_ROOT/$pkg" "package/node_modules/@deepseek-ai/$pkg"
+  ln -sfn "$PEERS_ROOT/$pkg" "node_modules/@deepseek-ai/$pkg"
   echo "linked @deepseek-ai/$pkg -> $PEERS_ROOT/$pkg"
 done
 
-echo "done. verify with: node -e \"await import('file://'\$(pwd)'/package/lib/index.js')\""
+echo "done. verify with: node -e \"await import('file://'\$(pwd)'/lib/index.js')\""
