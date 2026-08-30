@@ -1,22 +1,37 @@
 // Contradictions Indicator — Host half (Cordis dynamic Plugin)
 //
 // Listens on the `llm/stream` waterfall for every model call in the process.
-// When a real conversation turn completes, fires a parallel `llm.stream()`
+// When a real conversation turn completes, may fire a parallel `llm.stream()`
 // call that reuses the identical conversation prefix (provider, model,
 // system, tools, sessionId, messages) and appends one user message asking
 // the model to analyze the conversation for contradictions and produce a
-// 0-100 coherence score. Never blocks the main call: `next()` is invoked
-// and returned immediately; analysis runs fire-and-forget afterwards.
+// 0-100 coherence score. Never blocks the main call.
 //
-// Exposes the latest result to the Client half via a Package-private RPC
-// handler: `harness.handle('get-analysis', ...)`.
+// Auto-analysis is OFF by default. The client can enable it per-session via
+// the 'set-auto' RPC, which sets autoEnabled = true. When enabled, analysis
+// fires every ANALYSIS_INTERVAL turns. turnsSinceLastAnalysis counts real
+// conversation turns and is returned to the client so it can display progress.
+//
+// A manual trigger is always available via the 'trigger-analysis' RPC,
+// regardless of whether auto is enabled.
 
-let analysisState = { score: null, commentary: null, status: 'idle', messageCount: 0 }
+let analysisState = {
+  score: null,
+  commentary: null,
+  status: 'idle',
+  messageCount: 0,
+  turnsSinceLastAnalysis: 0,
+  autoEnabled: false
+}
 let analysisGeneration = 0
 let lastAnalyzedCount = 0
+let turnsSinceLastAnalysis = 0
+let autoEnabled = false
+let lastOptions = null  // snapshot of the most recent valid llm/stream options
 
 const MIN_MESSAGES = 4
-const MAX_TOKENS = 2048
+const ANALYSIS_INTERVAL = 25
+const MAX_TOKENS = 20000
 const PLUGIN_TAG = 'contradictions-indicator'
 
 const ANALYSIS_PROMPT = [
@@ -70,15 +85,41 @@ function parseAnalysisResponse(text) {
   return { score: score === null ? 50 : score, commentary: commentary }
 }
 
+function buildSnapshot() {
+  return {
+    score: analysisState.score,
+    commentary: analysisState.commentary,
+    status: analysisState.status,
+    messageCount: analysisState.messageCount,
+    turnsSinceLastAnalysis: turnsSinceLastAnalysis,
+    turnsUntilNext: autoEnabled ? Math.max(0, ANALYSIS_INTERVAL - turnsSinceLastAnalysis) : null,
+    autoEnabled: autoEnabled,
+    analysisInterval: ANALYSIS_INTERVAL
+  }
+}
+
 return {
   apply(ctx) {
     harness.handle('get-analysis', function () {
-      return {
-        score: analysisState.score,
-        commentary: analysisState.commentary,
-        status: analysisState.status,
-        messageCount: analysisState.messageCount
+      return buildSnapshot()
+    })
+
+    harness.handle('set-auto', function (args) {
+      autoEnabled = (args && args.enabled === true)
+      analysisState = Object.assign({}, analysisState, { autoEnabled: autoEnabled })
+      return buildSnapshot()
+    })
+
+    harness.handle('trigger-analysis', function () {
+      if (!lastOptions) {
+        return { triggered: false, reason: 'No conversation data available yet — send at least ' + MIN_MESSAGES + ' messages first.' }
       }
+      const llm = ctx.get('llm')
+      if (!llm) {
+        return { triggered: false, reason: 'LLM service not available.' }
+      }
+      scheduleAnalysis(llm, lastOptions)
+      return { triggered: true }
     })
 
     async function runAnalysis(llm, originalOptions) {
@@ -130,6 +171,7 @@ return {
 
     function scheduleAnalysis(llm, options) {
       lastAnalyzedCount = options.messages.length
+      turnsSinceLastAnalysis = 0
       analysisGeneration += 1
       const myGeneration = analysisGeneration
 
@@ -137,7 +179,8 @@ return {
         score: analysisState.score,
         commentary: analysisState.commentary,
         status: 'analyzing',
-        messageCount: analysisState.messageCount
+        messageCount: analysisState.messageCount,
+        autoEnabled: autoEnabled
       }
 
       runAnalysis(llm, options).then(function (result) {
@@ -146,7 +189,8 @@ return {
           score: result.score,
           commentary: result.commentary,
           status: 'ready',
-          messageCount: options.messages.length
+          messageCount: options.messages.length,
+          autoEnabled: autoEnabled
         }
       }).catch(function (err) {
         console.error('contradictions-indicator: analysis failed', err)
@@ -155,7 +199,8 @@ return {
           score: analysisState.score,
           commentary: analysisState.commentary,
           status: 'error',
-          messageCount: analysisState.messageCount
+          messageCount: analysisState.messageCount,
+          autoEnabled: autoEnabled
         }
       })
     }
@@ -173,6 +218,16 @@ return {
         }
 
         if (options.messages.length === lastAnalyzedCount) return stream
+
+        // Always snapshot the latest valid options for manual trigger
+        lastOptions = options
+
+        // Count this as a real turn
+        turnsSinceLastAnalysis += 1
+
+        // Only auto-fire if enabled and interval reached
+        if (!autoEnabled) return stream
+        if (turnsSinceLastAnalysis < ANALYSIS_INTERVAL) return stream
 
         const llm = ctx.get('llm')
         if (llm === undefined) return stream
