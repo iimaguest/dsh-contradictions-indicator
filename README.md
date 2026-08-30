@@ -4,13 +4,23 @@ A DeepSeek Harness plugin that scores the live conversation for internal contrad
 
 0 means the conversation is riddled with contradictions. 100 means it is consistent. Click the badge for commentary, a manual Analyze Now button, and per-session controls.
 
-## Install
+## Install, update, and remove
+
+Use the web profile:
 
 ```sh
-dsh plugin add https://github.com/iimaguest/dsh-contradictions-indicator
+dsh plugin --profile web add https://github.com/iimaguest/dsh-contradictions-indicator
 ```
 
-Restart or refresh `dsh web`. The badge appears in the conversation header utilities. Global defaults live under **Settings → Plugins → Contradictions**.
+```sh
+dsh plugin --profile web update dsh-contradictions-indicator
+```
+
+```sh
+dsh plugin --profile web remove dsh-contradictions-indicator
+```
+
+`dsh plugin --profile web` forwards to pnpm in that profile directory (`add` / `update` / `remove`). After add or update, restart `dsh web` so the host and client halves load. The badge appears in the conversation header utilities. Global defaults live under **Settings → Plugins → Contradictions**.
 
 Requires DSH web with the settings and conversation UI packages that this plugin injects.
 
