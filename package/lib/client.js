@@ -59,9 +59,14 @@ window.__ModuleLoader__.load({
 			'  border-top: 1px solid var(--dsw-alias-border-l1);',
 			'  border-bottom: 1px solid var(--dsw-alias-border-l1); flex-shrink: 0;',
 			'}',
-			'.contra-auto-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }',
+			'.contra-auto-row { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-wrap: wrap; }',
 			'.contra-auto-row label { cursor: pointer; color: var(--dsw-alias-label-primary); user-select: none; }',
 			'.contra-auto-row input[type=checkbox] { cursor: pointer; width: 14px; height: 14px; flex-shrink: 0; }',
+			'.contra-interval-input {',
+			'  width: 52px; height: 22px; padding: 0 6px; border-radius: 4px;',
+			'  border: 1px solid var(--dsw-alias-border-l1); background: transparent;',
+			'  color: var(--dsw-alias-label-primary); font-size: 12px; font-family: inherit;',
+			'}',
 			'.contra-progress { font-size: 11px; color: var(--dsw-alias-label-secondary); padding-left: 22px; }',
 			'.contra-progress-bar-track { height: 4px; border-radius: 2px; background: var(--dsw-alias-border-l1); margin-top: 4px; overflow: hidden; }',
 			'.contra-progress-bar-fill { height: 100%; border-radius: 2px; background: var(--dsw-alias-state-success-primary); transition: width 0.3s ease; }',
@@ -100,10 +105,9 @@ window.__ModuleLoader__.load({
 		const EMPTY = {
 			score: null, commentary: null, status: 'idle', messageCount: 0,
 			turnsSinceLastAnalysis: 0, turnsUntilNext: null,
-			autoEnabled: false, analysisInterval: 25
+			autoEnabled: false, steerEnabled: true, analysisInterval: 25
 		};
 
-		/** Shared store: the badge and the overlay live in separate slot subtrees. */
 		const store = {
 			state: EMPTY,
 			listeners: [],
@@ -141,6 +145,14 @@ window.__ModuleLoader__.load({
 			notifyOverlay();
 		}
 
+		function adoptSession(id) {
+			if (!id || id === store.sessionId) return;
+			store.sessionId = id;
+			store.state = EMPTY;
+			notifyState();
+			poll();
+		}
+
 		function query() {
 			return store.sessionId ? '?sessionId=' + encodeURIComponent(store.sessionId) : '';
 		}
@@ -156,11 +168,11 @@ window.__ModuleLoader__.load({
 				.catch(() => {});
 		}
 
-		function setAuto(enabled) {
+		function patchSettings(partial) {
 			fetch('/contradictions/auto' + query(), {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ enabled: enabled })
+				body: JSON.stringify(partial)
 			})
 				.then((r) => r.ok ? r.json() : null)
 				.then((body) => {
@@ -185,9 +197,12 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region components
-		function ContradictionsBadge() {
+		function ContradictionsBadge(props) {
 			const [state, setState] = react.useState(store.state);
 			react.useEffect(() => subscribeState(setState), []);
+			react.useEffect(() => {
+				if (props && props.sessionId) adoptSession(props.sessionId);
+			}, [props && props.sessionId]);
 
 			if (state.status === 'analyzing' && state.score === null) {
 				return h('span', {
@@ -221,6 +236,7 @@ window.__ModuleLoader__.load({
 			const [state, setState] = react.useState(store.state);
 			const [triggering, setTriggering] = react.useState(false);
 			const [triggerMsg, setTriggerMsg] = react.useState(null);
+			const [intervalDraft, setIntervalDraft] = react.useState(String(state.analysisInterval || 25));
 
 			react.useEffect(() => {
 				const a = subscribeOverlay(setVisible);
@@ -228,9 +244,14 @@ window.__ModuleLoader__.load({
 				return () => { a(); b(); };
 			}, []);
 
+			react.useEffect(() => {
+				setIntervalDraft(String(state.analysisInterval || 25));
+			}, [state.analysisInterval]);
+
 			if (!visible) return null;
 
 			const isAnalyzing = state.status === 'analyzing';
+			const interval = state.analysisInterval || 25;
 
 			let statusText;
 			if (isAnalyzing) statusText = 'Analyzing\u2026';
@@ -239,16 +260,18 @@ window.__ModuleLoader__.load({
 			else statusText = 'No analysis yet';
 
 			let progressEl = null;
-			if (state.autoEnabled && state.turnsUntilNext !== null && state.turnsUntilNext !== undefined) {
-				const pct = state.analysisInterval > 0
-					? Math.min(100, Math.round((state.turnsSinceLastAnalysis / state.analysisInterval) * 100))
-					: 0;
+			if (state.autoEnabled) {
+				const until = state.turnsUntilNext == null
+					? Math.max(0, interval - (state.turnsSinceLastAnalysis || 0))
+					: state.turnsUntilNext;
+				const done = state.turnsSinceLastAnalysis || 0;
+				const pct = interval > 0 ? Math.min(100, Math.round((done / interval) * 100)) : 0;
 				progressEl = h('div', { className: 'contra-progress' },
-					state.turnsUntilNext === 0
+					until === 0
 						? 'Next analysis: this turn'
-						: 'Next auto-analysis in ' + state.turnsUntilNext + ' turn' +
-						  (state.turnsUntilNext === 1 ? '' : 's') +
-						  ' (' + state.turnsSinceLastAnalysis + '\u00a0/\u00a0' + state.analysisInterval + ')',
+						: 'Next auto-analysis in ' + until + ' turn' +
+						  (until === 1 ? '' : 's') +
+						  ' (' + done + '\u00a0/\u00a0' + interval + ')',
 					h('div', { className: 'contra-progress-bar-track' },
 						h('div', { className: 'contra-progress-bar-fill', style: { width: pct + '%' } })
 					)
@@ -270,6 +293,17 @@ window.__ModuleLoader__.load({
 				});
 			}
 
+			function commitInterval() {
+				const n = Math.round(Number(intervalDraft));
+				if (!Number.isFinite(n) || n < 1) {
+					setIntervalDraft(String(interval));
+					return;
+				}
+				const clamped = Math.min(500, Math.max(1, n));
+				setIntervalDraft(String(clamped));
+				if (clamped !== interval) patchSettings({ interval: clamped });
+			}
+
 			return h('div', { className: 'contra-overlay' },
 				h('div', { className: 'contra-overlay-header' },
 					h('div', { className: 'contra-overlay-title' }, 'Contradiction Analysis'),
@@ -285,10 +319,30 @@ window.__ModuleLoader__.load({
 							type: 'checkbox',
 							id: 'contra-auto-checkbox',
 							checked: state.autoEnabled === true,
-							onChange: (e) => setAuto(e.target.checked)
+							onChange: (e) => patchSettings({ enabled: e.target.checked })
 						}),
-						h('label', { htmlFor: 'contra-auto-checkbox' },
-							'Auto-analyze every ' + state.analysisInterval + ' turns')
+						h('label', { htmlFor: 'contra-auto-checkbox' }, 'Auto-analyze every'),
+						h('input', {
+							className: 'contra-interval-input',
+							type: 'number',
+							min: 1,
+							max: 500,
+							value: intervalDraft,
+							onChange: (e) => setIntervalDraft(e.target.value),
+							onBlur: commitInterval,
+							onKeyDown: (e) => { if (e.key === 'Enter') commitInterval(); }
+						}),
+						h('label', { htmlFor: 'contra-auto-checkbox' }, 'turns')
+					),
+					h('div', { className: 'contra-auto-row' },
+						h('input', {
+							type: 'checkbox',
+							id: 'contra-steer-checkbox',
+							checked: state.steerEnabled !== false,
+							onChange: (e) => patchSettings({ steer: e.target.checked })
+						}),
+						h('label', { htmlFor: 'contra-steer-checkbox' },
+							'Steer next turn with a system reminder')
 					),
 					progressEl,
 					h('button', {
@@ -313,24 +367,8 @@ window.__ModuleLoader__.load({
 		const inject = ["slots"];
 
 		function apply(ctx) {
-			// Track the active session so state is scoped per conversation.
-			try {
-				const conversation = ctx.get && ctx.get('conversation');
-				if (conversation && typeof conversation.subscribe === 'function') {
-					ctx.effect(() => conversation.subscribe((s) => {
-						const id = s && (s.sessionId || s.id);
-						if (id && id !== store.sessionId) {
-							store.sessionId = id;
-							store.state = EMPTY;
-							notifyState();
-							poll();
-						}
-					}), 'contradictions: session tracking');
-				}
-			} catch {}
-
 			poll();
-			const timer = setInterval(poll, 3000);
+			const timer = setInterval(poll, 1500);
 			ctx.effect(() => () => clearInterval(timer), 'contradictions: poll timer');
 
 			ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () =>

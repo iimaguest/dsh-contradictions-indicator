@@ -1,38 +1,31 @@
-// Contradictions Indicator — Host half (Cordis dynamic Plugin)
-//
-// Listens on the `llm/stream` waterfall for every model call in the process.
-// When a real conversation turn completes, may fire a parallel `llm.stream()`
-// call that reuses the identical conversation prefix (provider, model,
-// system, tools, sessionId, messages) and appends one user message asking
-// the model to analyze the conversation for contradictions and produce a
-// 0-100 coherence score. Never blocks the main call.
-//
-// Auto-analysis is OFF by default. The client can enable it per-session via
-// the 'set-auto' RPC, which sets autoEnabled = true. When enabled, analysis
-// fires every ANALYSIS_INTERVAL turns. turnsSinceLastAnalysis counts real
-// conversation turns and is returned to the client so it can display progress.
-//
-// A manual trigger is always available via the 'trigger-analysis' RPC,
-// regardless of whether auto is enabled.
-
-let analysisState = {
-  score: null,
-  commentary: null,
-  status: 'idle',
-  messageCount: 0,
-  turnsSinceLastAnalysis: 0,
-  autoEnabled: false
-}
-let analysisGeneration = 0
-let lastAnalyzedCount = 0
-let turnsSinceLastAnalysis = 0
-let autoEnabled = false
-let lastOptions = null  // snapshot of the most recent valid llm/stream options
+/**
+ * dsh-contradictions-indicator — host half.
+ *
+ * Listens on the `llm/stream` waterfall for every model call in the process.
+ * For a real conversation turn it may fire a PARALLEL `llm.stream()` call that
+ * reuses the identical conversation prefix (provider, model, system, tools,
+ * sessionId, messages) and appends exactly one user message asking the model to
+ * analyze the conversation for contradictions and return a 0-100 coherence
+ * score. Because only a suffix is appended, the provider's KV/prefix cache
+ * stays warm for the analysis call.
+ *
+ * The main call is never blocked: `next()` is invoked and its stream returned
+ * immediately; the analysis runs fire-and-forget afterwards.
+ *
+ * Auto-analysis is OFF by default and is opted into per session from the UI.
+ * A manual trigger is always available. When analysis completes, a
+ * <system-reminder> user message is appended to the NEXT real conversation
+ * call (steer, default ON, user-disableable).
+ *
+ * State is keyed by sessionId. HTTP polls without a sessionId fall back to
+ * the most recently seen conversation so the progress counter actually moves.
+ */
 
 const MIN_MESSAGES = 4
-const ANALYSIS_INTERVAL = 25
+const DEFAULT_INTERVAL = 25
 const MAX_TOKENS = 20000
 const PLUGIN_TAG = 'contradictions-indicator'
+const MAX_SESSIONS = 50
 
 const ANALYSIS_PROMPT = [
   'IMPORTANT: Do NOT use any tools. Do NOT call any functions. Respond with text only.',
@@ -55,22 +48,75 @@ const ANALYSIS_PROMPT = [
   '',
   'Where 0 means the conversation is riddled with contradictions,',
   'and 100 means the conversation is perfectly smooth and consistent.',
-  'If you find no contradictions, say so and give a high score.'
+  'If you find no contradictions, say so and give a high score.',
 ].join('\n')
+
+/** Per-session analysis state, keyed by sessionId. */
+const sessions = new Map()
+/** Most recently seen real conversation session — HTTP fallback. */
+let lastActiveKey = null
+
+function clampInterval(n) {
+  const v = Math.round(Number(n))
+  if (!Number.isFinite(v)) return DEFAULT_INTERVAL
+  return Math.min(500, Math.max(1, v))
+}
+
+function stateFor(sessionId) {
+  const key = sessionId || lastActiveKey || '__global__'
+  let entry = sessions.get(key)
+  if (entry === undefined) {
+    entry = {
+      key,
+      score: null,
+      commentary: null,
+      status: 'idle',
+      messageCount: 0,
+      turnsSinceLastAnalysis: 0,
+      autoEnabled: false,
+      steerEnabled: true,
+      interval: DEFAULT_INTERVAL,
+      pendingSteer: null,
+      generation: 0,
+      lastAnalyzedCount: 0,
+      lastOptions: null,
+    }
+    sessions.set(key, entry)
+    if (sessions.size > MAX_SESSIONS) {
+      const oldest = sessions.keys().next()
+      if (!oldest.done && oldest.value !== key) sessions.delete(oldest.value)
+    }
+  }
+  return entry
+}
+
+function snapshot(entry) {
+  const until = entry.autoEnabled
+    ? Math.max(0, entry.interval - entry.turnsSinceLastAnalysis)
+    : null
+  return {
+    score: entry.score,
+    commentary: entry.commentary,
+    status: entry.status,
+    messageCount: entry.messageCount,
+    turnsSinceLastAnalysis: entry.turnsSinceLastAnalysis,
+    turnsUntilNext: until,
+    autoEnabled: entry.autoEnabled,
+    steerEnabled: entry.steerEnabled,
+    analysisInterval: entry.interval,
+    sessionKey: entry.key,
+  }
+}
 
 function parseAnalysisResponse(text) {
   let score = null
   let commentary = text
 
   const scoreMatch = text.match(/SCORE:\s*(\d+)/i)
-  if (scoreMatch) {
-    score = Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10)))
-  }
+  if (scoreMatch) score = Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10)))
 
   const analysisMatch = text.match(/ANALYSIS:\s*([\s\S]*)/i)
-  if (analysisMatch) {
-    commentary = analysisMatch[1].trim()
-  }
+  if (analysisMatch) commentary = analysisMatch[1].trim()
 
   if (score === null) {
     const numMatch = text.match(/\b(\d{1,3})\b/)
@@ -81,163 +127,251 @@ function parseAnalysisResponse(text) {
   }
 
   if (!commentary || commentary.length === 0) commentary = text
-
-  return { score: score === null ? 50 : score, commentary: commentary }
+  return { score: score === null ? 50 : score, commentary }
 }
 
-function buildSnapshot() {
-  return {
-    score: analysisState.score,
-    commentary: analysisState.commentary,
-    status: analysisState.status,
-    messageCount: analysisState.messageCount,
-    turnsSinceLastAnalysis: turnsSinceLastAnalysis,
-    turnsUntilNext: autoEnabled ? Math.max(0, ANALYSIS_INTERVAL - turnsSinceLastAnalysis) : null,
-    autoEnabled: autoEnabled,
-    analysisInterval: ANALYSIS_INTERVAL
+function sendJson(response, status, body) {
+  const payload = JSON.stringify(body)
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  })
+  response.end(payload)
+}
+
+function sessionIdFrom(request) {
+  try {
+    const url = new URL(request.url ?? '/', 'http://localhost')
+    return url.searchParams.get('sessionId') || null
+  } catch {
+    return null
   }
 }
 
-return {
-  apply(ctx) {
-    harness.handle('get-analysis', function () {
-      return buildSnapshot()
+function readBody(request) {
+  return new Promise((resolve) => {
+    let raw = ''
+    request.on('data', (chunk) => {
+      raw += chunk
+      if (raw.length > 1_000_000) raw = raw.slice(0, 1_000_000)
     })
-
-    harness.handle('set-auto', function (args) {
-      autoEnabled = (args && args.enabled === true)
-      analysisState = Object.assign({}, analysisState, { autoEnabled: autoEnabled })
-      return buildSnapshot()
+    request.on('end', () => {
+      try {
+        resolve(raw.length > 0 ? JSON.parse(raw) : {})
+      } catch {
+        resolve({})
+      }
     })
+    request.on('error', () => resolve({}))
+  })
+}
 
-    harness.handle('trigger-analysis', function () {
-      if (!lastOptions) {
-        return { triggered: false, reason: 'No conversation data available yet — send at least ' + MIN_MESSAGES + ' messages first.' }
+function isOurAnalysisCall(lastMsg) {
+  return lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG
+}
+
+function isOurSteerCall(lastMsg) {
+  return lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG + '-steer'
+}
+
+export const name = 'dsh-contradictions-indicator'
+
+export function apply(ctx) {
+  async function runAnalysis(llm, originalOptions) {
+    const analysisMessage = {
+      id: 'contra-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2),
+      role: 'user',
+      content: [{ type: 'text', text: ANALYSIS_PROMPT }],
+      source: { kind: 'plugin', plugin: PLUGIN_TAG },
+    }
+
+    const messages = originalOptions.messages.slice()
+    messages.push(analysisMessage)
+
+    const analysisOptions = {
+      provider: originalOptions.provider,
+      model: originalOptions.model,
+      messages,
+      maxTokens: MAX_TOKENS,
+    }
+    if (originalOptions.system !== undefined) analysisOptions.system = originalOptions.system
+    if (originalOptions.tools !== undefined) analysisOptions.tools = originalOptions.tools
+    if (originalOptions.sessionId !== undefined) analysisOptions.sessionId = originalOptions.sessionId
+
+    let fullText = ''
+    let sawError = null
+
+    for await (const chunk of llm.stream(analysisOptions)) {
+      if (chunk.type === 'text-delta') {
+        fullText += chunk.text
+      } else if (chunk.type === 'finish') {
+        if (chunk.reason && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+          sawError = chunk.reason
+        }
       }
-      const llm = ctx.get('llm')
-      if (!llm) {
-        return { triggered: false, reason: 'LLM service not available.' }
+    }
+
+    if (sawError !== null) throw new Error('analysis model call ended with ' + sawError.kind)
+    if (fullText.trim().length === 0) throw new Error('analysis model call produced no text')
+
+    return parseAnalysisResponse(fullText)
+  }
+
+  function scheduleAnalysis(entry, llm, options) {
+    entry.lastAnalyzedCount = options.messages.length
+    entry.turnsSinceLastAnalysis = 0
+    entry.generation += 1
+    const myGeneration = entry.generation
+    entry.status = 'analyzing'
+
+    runAnalysis(llm, options).then((result) => {
+      if (myGeneration !== entry.generation) return
+      entry.score = result.score
+      entry.commentary = result.commentary
+      entry.status = 'ready'
+      entry.messageCount = options.messages.length
+      if (entry.steerEnabled) {
+        entry.pendingSteer =
+          '<system-reminder>\nContradiction check (automatic, not from the user). ' +
+          'Coherence score: ' + result.score + '/100 ' +
+          '(0 = riddled with contradictions, 100 = fully consistent).\n\n' +
+          result.commentary +
+          '\n\nIf contradictions are named above, resolve or surface them before continuing. ' +
+          'Do not mention this reminder verbatim.\n</system-reminder>'
+      } else {
+        entry.pendingSteer = null
       }
-      scheduleAnalysis(llm, lastOptions)
-      return { triggered: true }
+    }).catch((error) => {
+      console.error('[dsh-contradictions-indicator] analysis failed', error)
+      if (myGeneration !== entry.generation) return
+      entry.status = 'error'
     })
+  }
 
-    async function runAnalysis(llm, originalOptions) {
-      const analysisMessage = {
-        id: 'contra-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2),
-        role: 'user',
-        content: [{ type: 'text', text: ANALYSIS_PROMPT }],
-        source: { kind: 'plugin', plugin: PLUGIN_TAG }
-      }
-
-      const messages = []
-      for (let i = 0; i < originalOptions.messages.length; i++) {
-        messages.push(originalOptions.messages[i])
-      }
-      messages.push(analysisMessage)
-
-      const analysisOptions = {
-        provider: originalOptions.provider,
-        model: originalOptions.model,
-        messages: messages,
-        maxTokens: MAX_TOKENS
-      }
-      if (originalOptions.system !== undefined) analysisOptions.system = originalOptions.system
-      if (originalOptions.tools !== undefined) analysisOptions.tools = originalOptions.tools
-      if (originalOptions.sessionId !== undefined) analysisOptions.sessionId = originalOptions.sessionId
-
-      let fullText = ''
-      let sawError = null
-
-      for await (const chunk of llm.stream(analysisOptions)) {
-        if (chunk.type === 'text-delta') {
-          fullText += chunk.text
-        } else if (chunk.type === 'finish') {
-          if (chunk.reason && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-            sawError = chunk.reason
+  ctx.on('llm/stream', (options, next) => {
+    try {
+      if (options.purpose === undefined && Array.isArray(options.messages)) {
+        const pending = stateFor(options.sessionId)
+        if (pending.pendingSteer && pending.steerEnabled) {
+          const last = options.messages[options.messages.length - 1]
+          if (!isOurAnalysisCall(last) && !isOurSteerCall(last)) {
+            options.messages.push({
+              id: 'contra-steer-' + Date.now().toString(36),
+              role: 'user',
+              content: [{ type: 'text', text: pending.pendingSteer }],
+              source: { kind: 'plugin', plugin: PLUGIN_TAG + '-steer' },
+            })
+            pending.pendingSteer = null
           }
         }
       }
-
-      if (sawError !== null) {
-        throw new Error('analysis model call ended with ' + sawError.kind)
-      }
-      if (fullText.trim().length === 0) {
-        throw new Error('analysis model call produced no text')
-      }
-
-      return parseAnalysisResponse(fullText)
+    } catch (error) {
+      console.error('[dsh-contradictions-indicator] steer injection failed', error)
     }
 
-    function scheduleAnalysis(llm, options) {
-      lastAnalyzedCount = options.messages.length
-      turnsSinceLastAnalysis = 0
-      analysisGeneration += 1
-      const myGeneration = analysisGeneration
+    const stream = next()
 
-      analysisState = {
-        score: analysisState.score,
-        commentary: analysisState.commentary,
-        status: 'analyzing',
-        messageCount: analysisState.messageCount,
-        autoEnabled: autoEnabled
+    try {
+      if (options.purpose !== undefined) return stream
+      if (!options.messages || options.messages.length < MIN_MESSAGES) return stream
+
+      const lastMsg = options.messages[options.messages.length - 1]
+      // Skip only our own analysis call, not the subsequent steer-injected turn.
+      if (isOurAnalysisCall(lastMsg)) return stream
+
+      const entry = stateFor(options.sessionId)
+      if (options.sessionId) lastActiveKey = options.sessionId
+      else lastActiveKey = entry.key
+
+      // Count every distinct conversation prefix. Tool-loop steps grow the
+      // message list, so this tracks real progress rather than wall-clock.
+      if (options.messages.length === entry.lastAnalyzedCount && entry.status !== 'analyzing') {
+        // Same snapshot seen twice (retries) — don't double-count.
+        if (entry.lastSeenCount === options.messages.length) return stream
       }
+      if (entry.lastSeenCount === options.messages.length) return stream
+      entry.lastSeenCount = options.messages.length
+      entry.lastOptions = options
+      entry.turnsSinceLastAnalysis += 1
 
-      runAnalysis(llm, options).then(function (result) {
-        if (myGeneration !== analysisGeneration) return
-        analysisState = {
-          score: result.score,
-          commentary: result.commentary,
-          status: 'ready',
-          messageCount: options.messages.length,
-          autoEnabled: autoEnabled
-        }
-      }).catch(function (err) {
-        console.error('contradictions-indicator: analysis failed', err)
-        if (myGeneration !== analysisGeneration) return
-        analysisState = {
-          score: analysisState.score,
-          commentary: analysisState.commentary,
-          status: 'error',
-          messageCount: analysisState.messageCount,
-          autoEnabled: autoEnabled
-        }
-      })
+      if (!entry.autoEnabled) return stream
+      if (entry.turnsSinceLastAnalysis < entry.interval) return stream
+
+      const llm = ctx.get('llm')
+      if (llm === undefined) return stream
+
+      scheduleAnalysis(entry, llm, options)
+    } catch (error) {
+      console.error('[dsh-contradictions-indicator] waterfall filter error', error)
     }
 
-    ctx.on('llm/stream', function (options, next) {
-      const stream = next()
+    return stream
+  })
 
-      try {
-        if (options.purpose !== undefined) return stream
-        if (!options.messages || options.messages.length < MIN_MESSAGES) return stream
-
-        const lastMsg = options.messages[options.messages.length - 1]
-        if (lastMsg && lastMsg.source && lastMsg.source.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG) {
-          return stream
+  ctx.inject(['webServer'], (host) => {
+    host.webServer.register({
+      kind: 'exact',
+      path: '/contradictions/state',
+      handler: (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
         }
-
-        if (options.messages.length === lastAnalyzedCount) return stream
-
-        // Always snapshot the latest valid options for manual trigger
-        lastOptions = options
-
-        // Count this as a real turn
-        turnsSinceLastAnalysis += 1
-
-        // Only auto-fire if enabled and interval reached
-        if (!autoEnabled) return stream
-        if (turnsSinceLastAnalysis < ANALYSIS_INTERVAL) return stream
-
-        const llm = ctx.get('llm')
-        if (llm === undefined) return stream
-
-        scheduleAnalysis(llm, options)
-      } catch (err) {
-        console.error('contradictions-indicator: waterfall filter error', err)
-      }
-
-      return stream
+        sendJson(response, 200, snapshot(stateFor(sessionIdFrom(request))))
+      },
     })
-  }
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/contradictions/auto',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        const body = await readBody(request)
+        const entry = stateFor(sessionIdFrom(request))
+        if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
+        if (typeof body?.steer === 'boolean') {
+          entry.steerEnabled = body.steer
+          if (!entry.steerEnabled) entry.pendingSteer = null
+        }
+        if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
+          entry.interval = clampInterval(body.interval)
+        }
+        sendJson(response, 200, snapshot(entry))
+      },
+    })
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/contradictions/trigger',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        const entry = stateFor(sessionIdFrom(request))
+        if (!entry.lastOptions) {
+          sendJson(response, 200, {
+            triggered: false,
+            reason: 'No conversation data yet — send at least ' + MIN_MESSAGES + ' messages first.',
+          })
+          return
+        }
+        const llm = ctx.get('llm')
+        if (llm === undefined) {
+          sendJson(response, 200, { triggered: false, reason: 'LLM service unavailable.' })
+          return
+        }
+        scheduleAnalysis(entry, llm, entry.lastOptions)
+        sendJson(response, 200, { triggered: true, state: snapshot(entry) })
+      },
+    })
+
+    console.log('[dsh-contradictions-indicator] host loaded')
+  })
 }

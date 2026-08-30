@@ -13,14 +13,16 @@
  * immediately; the analysis runs fire-and-forget afterwards.
  *
  * Auto-analysis is OFF by default and is opted into per session from the UI.
- * A manual trigger is always available.
+ * A manual trigger is always available. When analysis completes, a
+ * <system-reminder> user message is appended to the NEXT real conversation
+ * call (steer, default ON, user-disableable).
  *
- * State is keyed by sessionId, and the client polls it over three HTTP
- * endpoints registered on the host web server.
+ * State is keyed by sessionId. HTTP polls without a sessionId fall back to
+ * the most recently seen conversation so the progress counter actually moves.
  */
 
 const MIN_MESSAGES = 4
-const ANALYSIS_INTERVAL = 25
+const DEFAULT_INTERVAL = 25
 const MAX_TOKENS = 20000
 const PLUGIN_TAG = 'contradictions-indicator'
 const MAX_SESSIONS = 50
@@ -51,44 +53,58 @@ const ANALYSIS_PROMPT = [
 
 /** Per-session analysis state, keyed by sessionId. */
 const sessions = new Map()
+/** Most recently seen real conversation session — HTTP fallback. */
+let lastActiveKey = null
+
+function clampInterval(n) {
+  const v = Math.round(Number(n))
+  if (!Number.isFinite(v)) return DEFAULT_INTERVAL
+  return Math.min(500, Math.max(1, v))
+}
 
 function stateFor(sessionId) {
-  const key = sessionId || '__global__'
+  const key = sessionId || lastActiveKey || '__global__'
   let entry = sessions.get(key)
   if (entry === undefined) {
     entry = {
+      key,
       score: null,
       commentary: null,
       status: 'idle',
       messageCount: 0,
       turnsSinceLastAnalysis: 0,
       autoEnabled: false,
+      steerEnabled: true,
+      interval: DEFAULT_INTERVAL,
+      pendingSteer: null,
       generation: 0,
       lastAnalyzedCount: 0,
       lastOptions: null,
     }
     sessions.set(key, entry)
-    // Bound memory: drop the oldest entry once the map grows past the cap.
     if (sessions.size > MAX_SESSIONS) {
       const oldest = sessions.keys().next()
-      if (!oldest.done) sessions.delete(oldest.value)
+      if (!oldest.done && oldest.value !== key) sessions.delete(oldest.value)
     }
   }
   return entry
 }
 
 function snapshot(entry) {
+  const until = entry.autoEnabled
+    ? Math.max(0, entry.interval - entry.turnsSinceLastAnalysis)
+    : null
   return {
     score: entry.score,
     commentary: entry.commentary,
     status: entry.status,
     messageCount: entry.messageCount,
     turnsSinceLastAnalysis: entry.turnsSinceLastAnalysis,
-    turnsUntilNext: entry.autoEnabled
-      ? Math.max(0, ANALYSIS_INTERVAL - entry.turnsSinceLastAnalysis)
-      : null,
+    turnsUntilNext: until,
     autoEnabled: entry.autoEnabled,
-    analysisInterval: ANALYSIS_INTERVAL,
+    steerEnabled: entry.steerEnabled,
+    analysisInterval: entry.interval,
+    sessionKey: entry.key,
   }
 }
 
@@ -150,14 +166,17 @@ function readBody(request) {
   })
 }
 
+function isOurAnalysisCall(lastMsg) {
+  return lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG
+}
+
+function isOurSteerCall(lastMsg) {
+  return lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG + '-steer'
+}
+
 export const name = 'dsh-contradictions-indicator'
 
 export function apply(ctx) {
-  /**
-   * Run the analysis call. Only a suffix is appended to the caller's exact
-   * message list, so the provider's prefix cache is reused rather than
-   * invalidated.
-   */
   async function runAnalysis(llm, originalOptions) {
     const analysisMessage = {
       id: 'contra-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2),
@@ -211,6 +230,17 @@ export function apply(ctx) {
       entry.commentary = result.commentary
       entry.status = 'ready'
       entry.messageCount = options.messages.length
+      if (entry.steerEnabled) {
+        entry.pendingSteer =
+          '<system-reminder>\nContradiction check (automatic, not from the user). ' +
+          'Coherence score: ' + result.score + '/100 ' +
+          '(0 = riddled with contradictions, 100 = fully consistent).\n\n' +
+          result.commentary +
+          '\n\nIf contradictions are named above, resolve or surface them before continuing. ' +
+          'Do not mention this reminder verbatim.\n</system-reminder>'
+      } else {
+        entry.pendingSteer = null
+      }
     }).catch((error) => {
       console.error('[dsh-contradictions-indicator] analysis failed', error)
       if (myGeneration !== entry.generation) return
@@ -218,34 +248,54 @@ export function apply(ctx) {
     })
   }
 
-  // ── the waterfall listener ────────────────────────────────────────────────
   ctx.on('llm/stream', (options, next) => {
-    // Never block the real call: start it first and return its stream.
+    try {
+      if (options.purpose === undefined && Array.isArray(options.messages)) {
+        const pending = stateFor(options.sessionId)
+        if (pending.pendingSteer && pending.steerEnabled) {
+          const last = options.messages[options.messages.length - 1]
+          if (!isOurAnalysisCall(last) && !isOurSteerCall(last)) {
+            options.messages.push({
+              id: 'contra-steer-' + Date.now().toString(36),
+              role: 'user',
+              content: [{ type: 'text', text: pending.pendingSteer }],
+              source: { kind: 'plugin', plugin: PLUGIN_TAG + '-steer' },
+            })
+            pending.pendingSteer = null
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[dsh-contradictions-indicator] steer injection failed', error)
+    }
+
     const stream = next()
 
     try {
-      // Skip non-conversation calls (compaction, session titling, …).
       if (options.purpose !== undefined) return stream
       if (!options.messages || options.messages.length < MIN_MESSAGES) return stream
 
-      // Recursion guard: never analyze our own analysis call.
       const lastMsg = options.messages[options.messages.length - 1]
-      if (lastMsg?.source?.kind === 'plugin' && lastMsg.source.plugin === PLUGIN_TAG) {
-        return stream
-      }
+      // Skip only our own analysis call, not the subsequent steer-injected turn.
+      if (isOurAnalysisCall(lastMsg)) return stream
 
       const entry = stateFor(options.sessionId)
+      if (options.sessionId) lastActiveKey = options.sessionId
+      else lastActiveKey = entry.key
 
-      // Debounce: the same message count is the same turn seen twice.
-      if (options.messages.length === entry.lastAnalyzedCount) return stream
-
-      // Always keep the newest options so the manual trigger has data.
+      // Count every distinct conversation prefix. Tool-loop steps grow the
+      // message list, so this tracks real progress rather than wall-clock.
+      if (options.messages.length === entry.lastAnalyzedCount && entry.status !== 'analyzing') {
+        // Same snapshot seen twice (retries) — don't double-count.
+        if (entry.lastSeenCount === options.messages.length) return stream
+      }
+      if (entry.lastSeenCount === options.messages.length) return stream
+      entry.lastSeenCount = options.messages.length
       entry.lastOptions = options
       entry.turnsSinceLastAnalysis += 1
 
-      // Auto-analysis is opt-in and interval-gated.
       if (!entry.autoEnabled) return stream
-      if (entry.turnsSinceLastAnalysis < ANALYSIS_INTERVAL) return stream
+      if (entry.turnsSinceLastAnalysis < entry.interval) return stream
 
       const llm = ctx.get('llm')
       if (llm === undefined) return stream
@@ -258,7 +308,6 @@ export function apply(ctx) {
     return stream
   })
 
-  // ── HTTP endpoints the client bundle polls ────────────────────────────────
   ctx.inject(['webServer'], (host) => {
     host.webServer.register({
       kind: 'exact',
@@ -284,7 +333,14 @@ export function apply(ctx) {
         }
         const body = await readBody(request)
         const entry = stateFor(sessionIdFrom(request))
-        entry.autoEnabled = body?.enabled === true
+        if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
+        if (typeof body?.steer === 'boolean') {
+          entry.steerEnabled = body.steer
+          if (!entry.steerEnabled) entry.pendingSteer = null
+        }
+        if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
+          entry.interval = clampInterval(body.interval)
+        }
         sendJson(response, 200, snapshot(entry))
       },
     })
