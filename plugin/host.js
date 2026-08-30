@@ -1,9 +1,22 @@
 /**
  * dsh-contradictions-indicator — host half.
  *
- * Parallel analysis of the live conversation for contradictions. Auto-analysis
- * is OFF by default per session. Global defaults (interval, steer, both prompt
- * texts) persist to disk and apply to new sessions.
+ * Parallel analysis of the live conversation for contradictions.
+ *
+ * SETTINGS MODEL (two strictly separated planes):
+ *
+ *  1. Global defaults — `autoEnabled`, `interval`, `steerEnabled`, and both
+ *     prompt texts. Persisted to disk, editable ONLY through the Settings tab
+ *     (`/contradictions/defaults`). They are read exactly once per session:
+ *     when that session's entry is first created. Editing them therefore
+ *     affects conversations started afterwards and never reaches into one that
+ *     already exists.
+ *
+ *  2. Per-session state — the same fields, seeded from the defaults at session
+ *     creation and thereafter owned solely by that session's panel
+ *     (`/contradictions/auto`). A per-session edit CANNOT write back to the
+ *     global defaults; the old `persist` flag that allowed it is gone, because
+ *     it meant tuning one conversation silently reconfigured every future one.
  */
 
 import { homedir } from 'node:os'
@@ -78,6 +91,10 @@ function clampPrompt(s, fallback) {
 
 function defaults() {
   return {
+    // Auto-analysis ships ON for every new conversation (requested default).
+    // Turn it off globally in Settings → Contradictions, or per conversation
+    // in the panel; both writes stay on their own plane.
+    autoEnabled: true,
     interval: DEFAULT_INTERVAL,
     steerEnabled: true,
     prompt1: DEFAULT_PROMPT1,
@@ -89,6 +106,9 @@ function normalizeGlobals(raw) {
   const d = defaults()
   if (!raw || typeof raw !== 'object') return d
   return {
+    // Missing field means "never written" → the shipped default (on). An
+    // explicit false from Settings is respected.
+    autoEnabled: raw.autoEnabled !== false,
     interval: clampInterval(raw.interval ?? d.interval),
     steerEnabled: raw.steerEnabled !== false,
     prompt1: clampPrompt(raw.prompt1, d.prompt1),
@@ -256,7 +276,10 @@ export function apply(ctx) {
         status: 'idle',
         messageCount: 0,
         turnsSinceLastAnalysis: 0,
-        autoEnabled: false,
+        // Seeded from the global defaults ONCE, at creation. From here on
+        // this entry is the sole owner of these five fields: later edits to
+        // the defaults deliberately do not propagate into a live session.
+        autoEnabled: globals.autoEnabled === true,
         steerEnabled: globals.steerEnabled,
         interval: globals.interval,
         prompt1: globals.prompt1,
@@ -306,6 +329,7 @@ export function apply(ctx) {
     if (settingsScope) {
       try {
         await settingsScope.update({
+          autoEnabled: resolved.autoEnabled,
           interval: resolved.interval,
           steerEnabled: resolved.steerEnabled,
           prompt1: resolved.prompt1,
@@ -325,6 +349,7 @@ export function apply(ctx) {
   }
 
   const ContraSettings = z.object({
+    autoEnabled: z.boolean().default(true),
     interval: z.number().default(DEFAULT_INTERVAL),
     steerEnabled: z.boolean().default(true),
     prompt1: z.string().default(DEFAULT_PROMPT1),
@@ -523,28 +548,25 @@ export function apply(ctx) {
           const body = await readBody(request)
           if (body?.__tooLarge) { sendJson(response, 413, { error: 'body too large' }); return }
           const entry = stateFor(sessionIdFrom(request))
-          const persist = body?.persist === true
-          const nextGlobals = { ...globals }
 
+          // This route writes THIS session's fields and nothing else. Any
+          // `persist` field in the body is ignored on purpose: promoting a
+          // per-conversation tweak into a global default is the Settings
+          // tab's job alone (`/contradictions/defaults`).
           if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
           if (typeof body?.steer === 'boolean') {
             entry.steerEnabled = body.steer
             if (!entry.steerEnabled) entry.pendingSteer = null
-            if (persist) nextGlobals.steerEnabled = body.steer
           }
           if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
             entry.interval = clampInterval(body.interval)
-            if (persist) nextGlobals.interval = entry.interval
           }
           if (typeof body?.prompt1 === 'string') {
             entry.prompt1 = clampPrompt(body.prompt1, DEFAULT_PROMPT1)
-            if (persist) nextGlobals.prompt1 = entry.prompt1
           }
           if (typeof body?.prompt2 === 'string') {
             entry.prompt2 = clampPrompt(body.prompt2, DEFAULT_PROMPT2)
-            if (persist) nextGlobals.prompt2 = entry.prompt2
           }
-          if (persist) await persistGlobals(nextGlobals)
           sendJson(response, 200, snapshot(entry))
         } catch (error) {
           console.error('[dsh-contradictions-indicator] /auto handler failed', error)
@@ -569,8 +591,9 @@ export function apply(ctx) {
           if (body?.__tooLarge) { sendJson(response, 413, { error: 'body too large' }); return }
           // Whitelist known fields only; never spread an arbitrary body
           // into persisted global state.
-          const { interval, steerEnabled, prompt1, prompt2 } = body || {}
+          const { autoEnabled, interval, steerEnabled, prompt1, prompt2 } = body || {}
           await persistGlobals({
+            autoEnabled: autoEnabled !== undefined ? autoEnabled === true : globals.autoEnabled,
             interval: interval !== undefined ? interval : globals.interval,
             steerEnabled: steerEnabled !== undefined ? steerEnabled : globals.steerEnabled,
             prompt1: prompt1 !== undefined ? prompt1 : globals.prompt1,

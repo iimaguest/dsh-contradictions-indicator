@@ -27,12 +27,16 @@ Requires DSH web with the settings and conversation UI packages that this plugin
 ## What it does
 
 - Watches main conversation `llm/stream` calls (skips compaction, session-title, and its own analysis calls).
-- On demand, or on an opt-in interval, fires a parallel model call that reuses the conversation's provider, model, system prompt, tools, session id, and messages, then appends one analysis user message so the provider KV cache stays warm.
+- On demand, or on a turn interval, fires a parallel model call that reuses the conversation's provider, model, system prompt, tools, session id, and messages, then appends one analysis user message so the provider KV cache stays warm.
 - Parses `SCORE: <n>` and `ANALYSIS: <text>` from that response.
 - Shows a colored header badge (green ≥80, yellow ≥50, red &lt;50) and an overlay with the commentary.
-- Auto-analysis is off per session until you enable it. Default interval is 25 turns (editable, 1–500).
+- Auto-analysis is **on by default** for new conversations (default interval 25 turns, editable 1–500). Turn it off globally in Settings → Plugins → Contradictions, or per conversation in the panel.
 - Optional next-turn system-reminder steer using `{{score}}` and `{{commentary}}`. Injected on `agent/pre-step` (not by mutating frozen `llm/stream` options). Off for the analysis itself if you uncheck it.
-- Global interval, steer default, and both prompt texts persist via DSH settings (with a file fallback at `~/.dsh/contradictions-indicator.json`).
+- The badge, panel, and settings tab are localized (English / 简体中文) through the shell's locale service, so **Settings → Language** applies to this plugin too, and every surface color/radius/shadow comes from the shell's `--dsw-*` theme tokens, so **Settings → Appearance** themes it like host UI.
+
+### Settings: two planes, strictly separated
+
+Global defaults (`autoEnabled`, interval, steer, both prompt texts) live in **Settings → Plugins → Contradictions** and persist via DSH settings (with a file fallback at `~/.dsh/contradictions-indicator.json`). Each conversation snapshots those defaults **once, at creation**; after that the conversation's panel owns its own copy. Editing settings therefore affects **only conversations started afterwards** — it never reaches into a live one — and adjusting one conversation never writes back to the defaults (the old `persist` flag on `/contradictions/auto` is ignored and gone).
 
 ## HTTP endpoints (local DSH web server)
 

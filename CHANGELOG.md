@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.2.0
+
+UI/UX and settings-semantics fixes from user feedback on the web client.
+
+- **Auto-analysis is now ON by default** for every new conversation (was:
+  opt-in per session). Turn it off globally in Settings → Contradictions or
+  per conversation in the panel. This knowingly changes the shipped default;
+  existing stored settings without an explicit `autoEnabled` resolve to on.
+- **Settings no longer leak across planes.** Previously the panel's per-session
+  edits carried a `persist` flag that wrote the *global* defaults — tuning one
+  conversation silently reconfigured every future one. The flag is now ignored
+  and removed from the client: `/contradictions/auto` writes only that
+  session's state, `/contradictions/defaults` (Settings tab) writes only the
+  defaults, and editing defaults never mutates a conversation that already
+  exists (each session snapshots the defaults once, at creation).
+- **The panel closes on outside click** (and Escape). A capture-phase
+  `pointerdown` listener dismisses it when the press lands outside both the
+  panel and the header badge, so the badge still toggles normally.
+- **Popup palette now matches the app.** The panel uses the shell's real
+  `--dsw-*` surface recipe (bg-layer-2 + border-inverted + shadow-lv3), and
+  every color/radius/font comes from published theme tokens, so it tracks
+  Settings → Appearance like host-owned UI.
+- **Settings → Language is respected.** The client registers en/zh
+  dictionaries with the shell locale service (`dsh.client.inject` now lists
+  `@deepseek-ai/dsh-client-locale`) and re-renders on language switches;
+  badge, panel, and settings tab are fully localized.
+- **The header badge matches the Session log button** exactly — same
+  32px height, 111px min-width, 18px radius capsule — and it now presents as
+  a disclosure control (text label, `aria-haspopup="dialog"`, `aria-expanded`,
+  rotating caret) instead of looking like a one-click "run analysis" action.
+  The actual run lives inside the panel as its primary button.
+
 ## 1.1.0
 
 Security and correctness fixes from a full code review. No user-facing
