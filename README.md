@@ -63,7 +63,26 @@ this.
 
 - `plugin/host.js` — Host half source (Cordis dynamic Plugin function body)
 - `plugin/client.js` — Client half source (Cordis dynamic Plugin function body)
+- `link-peer-deps.sh` — links the `@deepseek-ai` peer packages into `package/node_modules` (see below)
 - `IMPLEMENTATION_PLAN.md` — original detailed implementation plan handed to the developer
+
+## Peer dependency links (required after a fresh clone)
+
+The host half imports `@deepseek-ai/dsh-settings` and
+`@deepseek-ai/schemastery`. These are dsh host packages: the profile
+installs this plugin via a `link:` dependency pointing at `./package`, and
+Node resolves imports from the **real** path (symlinks are followed), so it
+never walks through the profile's `node_modules` where those packages live.
+Without a local link, `dsh web` fails with
+`Cannot find package '@deepseek-ai/dsh-settings' imported from
+.../package/lib/index.js`.
+
+Fix (idempotent, `node_modules/` is gitignored so re-run after a fresh
+clone):
+
+```sh
+./link-peer-deps.sh
+```
 
 ## Known limitations (v1, by design)
 
