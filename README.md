@@ -45,6 +45,11 @@ The host half registers four exact paths on the DSH web server. They are meant f
 | GET/POST | `/contradictions/defaults` | Read or write global defaults |
 | POST | `/contradictions/trigger?sessionId=` | Run analysis now |
 
+These routes are not covered by DSH's `/api` browser-trust fence, so the plugin
+applies its own same-origin check (`Sec-Fetch-Site` / `Origin` vs `Host`) and
+rejects cross-site requests before touching session state. All four also
+reject bodies over 1&nbsp;MB and cap persisted prompt text length.
+
 ## Peer packages after a local clone
 
 If you `link:` this directory into a profile, Node resolves imports from the real path and will not see the profile's `@deepseek-ai` packages. Re-run after a fresh clone (`node_modules/` is gitignored):
@@ -52,6 +57,24 @@ If you `link:` this directory into a profile, Node resolves imports from the rea
 ```sh
 ./link-peer-deps.sh
 ```
+
+Only `dsh-settings` and `schemastery` are linked — those are the only bare
+`import`s this plugin's host half actually executes in Node. `cordis` is a
+type-only import (used solely by `lib/types/index.d.ts`) and `react` is
+resolved through the DSH browser module table, not Node's `node_modules`, so
+neither needs linking here.
+
+All four `peerDependencies` are marked `optional` in `package.json`. That is
+the correct *install* contract for a DSH host plugin — it tells pnpm these
+packages are provided by the profile, not duplicated by this package — but it
+does **not** mean the plugin runs without them. `lib/index.js` hard-imports
+`@deepseek-ai/dsh-settings` and `@deepseek-ai/schemastery` and will fail to
+load if the profile does not provide them.
+
+The `./client` export (`lib/client.js`) is a DSH `window.__ModuleLoader__`
+lazy-load factory, not a standard ESM/CJS module. It only runs inside the DSH
+browser runtime; `import … from 'dsh-contradictions-indicator/client'` will
+not work outside of it.
 
 ## Layout
 

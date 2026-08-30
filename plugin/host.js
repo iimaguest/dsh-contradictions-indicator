@@ -14,9 +14,15 @@ import z from '@deepseek-ai/schemastery'
 
 const MIN_MESSAGES = 4
 const DEFAULT_INTERVAL = 25
+// Kept generously high on purpose: a truncated finish_reason ('length')
+// before the model reaches 'ANALYSIS:' wastes the entire parallel call and
+// forces a retry, which costs far more than the token budget itself.
 const MAX_TOKENS = 20000
+const ANALYSIS_TIMEOUT_MS = 120_000
 const PLUGIN_TAG = 'contradictions-indicator'
 const MAX_SESSIONS = 50
+const MAX_PROMPT_LENGTH = 20_000
+const MAX_BODY_BYTES = 1_000_000
 const SETTINGS_NS = 'contradictions-indicator'
 
 const DEFAULT_PROMPT1 = [
@@ -63,6 +69,13 @@ function clampInterval(n) {
   return Math.min(500, Math.max(1, v))
 }
 
+function clampPrompt(s, fallback) {
+  if (typeof s !== 'string') return fallback
+  const trimmed = s.trim()
+  if (!trimmed) return fallback
+  return s.length > MAX_PROMPT_LENGTH ? s.slice(0, MAX_PROMPT_LENGTH) : s
+}
+
 function defaults() {
   return {
     interval: DEFAULT_INTERVAL,
@@ -78,66 +91,8 @@ function normalizeGlobals(raw) {
   return {
     interval: clampInterval(raw.interval ?? d.interval),
     steerEnabled: raw.steerEnabled !== false,
-    prompt1: typeof raw.prompt1 === 'string' && raw.prompt1.trim() ? raw.prompt1 : d.prompt1,
-    prompt2: typeof raw.prompt2 === 'string' && raw.prompt2.trim() ? raw.prompt2 : d.prompt2,
-  }
-}
-
-/** Per-session analysis state, keyed by sessionId. */
-const sessions = new Map()
-let lastActiveKey = null
-let globals = defaults()
-let settingsScope = null
-
-function stateFor(sessionId) {
-  const key = sessionId || lastActiveKey || '__global__'
-  let entry = sessions.get(key)
-  if (entry === undefined) {
-    entry = {
-      key,
-      score: null,
-      commentary: null,
-      status: 'idle',
-      messageCount: 0,
-      turnsSinceLastAnalysis: 0,
-      autoEnabled: false,
-      steerEnabled: globals.steerEnabled,
-      interval: globals.interval,
-      prompt1: globals.prompt1,
-      prompt2: globals.prompt2,
-      pendingSteer: null,
-      generation: 0,
-      lastAnalyzedCount: 0,
-      lastSeenCount: 0,
-      lastOptions: null,
-    }
-    sessions.set(key, entry)
-    if (sessions.size > MAX_SESSIONS) {
-      const oldest = sessions.keys().next()
-      if (!oldest.done && oldest.value !== key) sessions.delete(oldest.value)
-    }
-  }
-  return entry
-}
-
-function snapshot(entry) {
-  const until = entry.autoEnabled
-    ? Math.max(0, entry.interval - entry.turnsSinceLastAnalysis)
-    : null
-  return {
-    score: entry.score,
-    commentary: entry.commentary,
-    status: entry.status,
-    messageCount: entry.messageCount,
-    turnsSinceLastAnalysis: entry.turnsSinceLastAnalysis,
-    turnsUntilNext: until,
-    autoEnabled: entry.autoEnabled,
-    steerEnabled: entry.steerEnabled,
-    analysisInterval: entry.interval,
-    prompt1: entry.prompt1,
-    prompt2: entry.prompt2,
-    sessionKey: entry.key,
-    globals,
+    prompt1: clampPrompt(raw.prompt1, d.prompt1),
+    prompt2: clampPrompt(raw.prompt2, d.prompt2),
   }
 }
 
@@ -148,28 +103,55 @@ function parseAnalysisResponse(text) {
   if (scoreMatch) score = Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10)))
   const analysisMatch = text.match(/ANALYSIS:\s*([\s\S]*)/i)
   if (analysisMatch) commentary = analysisMatch[1].trim()
-  if (score === null) {
-    const numMatch = text.match(/\b(\d{1,3})\b/)
-    if (numMatch) {
-      const n = parseInt(numMatch[1], 10)
-      if (n >= 0 && n <= 100) score = n
-    }
-  }
+  // No loose numeric fallback: an unparsable response defaults to a neutral
+  // score (50) rather than guessing from any stray digit in the prose.
   if (!commentary || commentary.length === 0) commentary = text
   return { score: score === null ? 50 : score, commentary }
 }
 
 function sendJson(response, status, body) {
+  if (response.headersSent || response.writableEnded) return
+  const json = JSON.stringify(body)
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(json),
   })
-  response.end(JSON.stringify(body))
+  response.end(json)
+}
+
+function sendMethodNotAllowed(response, allow) {
+  if (response.headersSent || response.writableEnded) return
+  response.writeHead(405, { allow, 'content-type': 'application/json; charset=utf-8' })
+  response.end(JSON.stringify({ error: 'method not allowed' }))
+}
+
+// --- Same-origin / trust check for the local DSH web server -------------
+// webServer routes are not covered by the /api trust fence, so this plugin
+// enforces its own: reject any request whose Origin/Sec-Fetch-Site indicate
+// a cross-site browser navigation (CSRF form posts, DNS-rebinding fetches).
+// A request with no Origin header at all (same-origin navigations, curl,
+// server-to-server) is allowed, matching same-origin browser fetch behavior
+// where the Origin header IS sent for state-changing requests.
+function isTrustedLocalRequest(request) {
+  const secFetchSite = request.headers['sec-fetch-site']
+  if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') return false
+  const origin = request.headers['origin']
+  if (!origin) return true
+  try {
+    const originHost = new URL(origin).host
+    const hostHeader = request.headers['host']
+    if (!hostHeader || originHost !== hostHeader) return false
+  } catch {
+    return false
+  }
+  return true
 }
 
 function sessionIdFrom(request) {
   try {
-    return new URL(request.url ?? '/', 'http://localhost').searchParams.get('sessionId') || null
+    const raw = new URL(request.url ?? '/', 'http://localhost').searchParams.get('sessionId')
+    return raw && raw.trim() ? raw : null
   } catch {
     return null
   }
@@ -178,15 +160,23 @@ function sessionIdFrom(request) {
 function readBody(request) {
   return new Promise((resolve) => {
     let raw = ''
+    let tooLarge = false
     request.on('data', (chunk) => {
-      raw += chunk
-      if (raw.length > 1_000_000) raw = raw.slice(0, 1_000_000)
+      if (tooLarge) return
+      raw += chunk.toString('utf8')
+      if (Buffer.byteLength(raw, 'utf8') > MAX_BODY_BYTES) {
+        tooLarge = true
+        raw = ''
+        request.destroy()
+      }
     })
     request.on('end', () => {
+      if (tooLarge) { resolve({ __tooLarge: true }); return }
       try { resolve(raw.length > 0 ? JSON.parse(raw) : {}) }
       catch { resolve({}) }
     })
     request.on('error', () => resolve({}))
+    request.on('aborted', () => resolve({}))
   })
 }
 
@@ -236,32 +226,104 @@ function renderSteer(template, score, commentary) {
     .replaceAll('{{commentary}}', commentary == null ? '' : String(commentary))
 }
 
-async function persistGlobals(next) {
-  globals = normalizeGlobals(next)
-  if (settingsScope) {
-    try {
-      await settingsScope.update({
-        interval: globals.interval,
-        steerEnabled: globals.steerEnabled,
-        prompt1: globals.prompt1,
-        prompt2: globals.prompt2,
-      })
-      return
-    } catch (error) {
-      console.error('[dsh-contradictions-indicator] settings.update failed', error)
-    }
-  }
-  try {
-    await mkdir(join(homedir(), '.dsh'), { recursive: true })
-    await writeFile(FALLBACK_PATH, JSON.stringify(globals, null, 2), 'utf8')
-  } catch (error) {
-    console.error('[dsh-contradictions-indicator] fallback persist failed', error)
-  }
-}
-
 export const name = 'dsh-contradictions-indicator'
 
 export function apply(ctx) {
+  // All mutable plugin state lives inside apply() so that stop/restart in
+  // the same process starts from a clean slate instead of inheriting stale
+  // sessions, listeners, or a settingsScope closure over a disposed ctx.
+  const sessions = new Map()
+  let lastActiveKey = null
+  let globals = defaults()
+  let settingsScope = null
+
+  function touchSession(key, entry) {
+    // Re-insertion moves the key to the end of Map iteration order, turning
+    // the eviction policy below into a true LRU instead of insertion-order
+    // FIFO that could evict an actively-used session.
+    sessions.delete(key)
+    sessions.set(key, entry)
+  }
+
+  function stateFor(sessionId) {
+    const key = sessionId || lastActiveKey || '__global__'
+    let entry = sessions.get(key)
+    if (entry === undefined) {
+      entry = {
+        key,
+        score: null,
+        commentary: null,
+        status: 'idle',
+        messageCount: 0,
+        turnsSinceLastAnalysis: 0,
+        autoEnabled: false,
+        steerEnabled: globals.steerEnabled,
+        interval: globals.interval,
+        prompt1: globals.prompt1,
+        prompt2: globals.prompt2,
+        pendingSteer: null,
+        generation: 0,
+        lastAnalyzedCount: 0,
+        lastSeenCount: 0,
+        lastOptions: null,
+        abortController: null,
+      }
+      sessions.set(key, entry)
+      if (sessions.size > MAX_SESSIONS) {
+        const oldest = sessions.keys().next()
+        if (!oldest.done && oldest.value !== key) sessions.delete(oldest.value)
+      }
+    } else {
+      touchSession(key, entry)
+    }
+    return entry
+  }
+
+  function snapshot(entry) {
+    const until = entry.autoEnabled
+      ? Math.max(0, entry.interval - entry.turnsSinceLastAnalysis)
+      : null
+    return {
+      score: entry.score,
+      commentary: entry.commentary,
+      status: entry.status,
+      messageCount: entry.messageCount,
+      turnsSinceLastAnalysis: entry.turnsSinceLastAnalysis,
+      turnsUntilNext: until,
+      autoEnabled: entry.autoEnabled,
+      steerEnabled: entry.steerEnabled,
+      analysisInterval: entry.interval,
+      prompt1: entry.prompt1,
+      prompt2: entry.prompt2,
+      sessionKey: entry.key,
+      globals: { ...globals },
+    }
+  }
+
+  async function persistGlobals(next) {
+    const resolved = normalizeGlobals(next)
+    globals = resolved
+    if (settingsScope) {
+      try {
+        await settingsScope.update({
+          interval: resolved.interval,
+          steerEnabled: resolved.steerEnabled,
+          prompt1: resolved.prompt1,
+          prompt2: resolved.prompt2,
+        })
+        return
+      } catch (error) {
+        console.error('[dsh-contradictions-indicator] settings.update failed', error)
+      }
+    }
+    try {
+      await mkdir(join(homedir(), '.dsh'), { recursive: true })
+      await writeFile(FALLBACK_PATH, JSON.stringify(resolved, null, 2), 'utf8')
+    } catch (error) {
+      console.error('[dsh-contradictions-indicator] fallback persist failed', error)
+    }
+  }
+
   const ContraSettings = z.object({
     interval: z.number().default(DEFAULT_INTERVAL),
     steerEnabled: z.boolean().default(true),
@@ -294,7 +356,7 @@ export function apply(ctx) {
     try { globals = normalizeGlobals(JSON.parse(text)) } catch {}
   }).catch(() => {})
 
-  async function runAnalysis(llm, originalOptions, prompt1) {
+  async function runAnalysis(llm, originalOptions, prompt1, signal) {
     const analysisMessage = {
       id: newMessageId('contra-'),
       role: 'user',
@@ -308,15 +370,26 @@ export function apply(ctx) {
       model: originalOptions.model,
       messages,
       maxTokens: MAX_TOKENS,
+      signal,
     }
     if (originalOptions.system !== undefined) analysisOptions.system = originalOptions.system
     if (originalOptions.tools !== undefined) analysisOptions.tools = originalOptions.tools
     if (originalOptions.sessionId !== undefined) analysisOptions.sessionId = originalOptions.sessionId
+    // `tools` is deliberately kept byte-identical to the original request:
+    // this call must be a pure suffix-append onto the exact same prefix
+    // (provider, model, system, tools, messages…) so the provider's KV
+    // cache is reused instead of invalidated — that's the whole point of
+    // firing this as a "parallel" analysis call instead of a fresh one.
+    // This is safe because runAnalysis() only ever reads `text-delta` and
+    // `finish` chunks from the raw llm.stream() below; it never dispatches
+    // to ctx.tools.execute(), so a tool-call chunk the model might emit
+    // here is simply ignored, never actually invoked.
 
     let fullText = ''
     let sawError = null
     for await (const chunk of llm.stream(analysisOptions)) {
-      if (chunk.type === 'text-delta') fullText += chunk.text
+      if (signal?.aborted) throw new Error('analysis aborted')
+      if (chunk.type === 'text-delta') fullText += (chunk.text ?? '')
       else if (chunk.type === 'finish') {
         if (chunk.reason && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
           sawError = chunk.reason
@@ -329,12 +402,26 @@ export function apply(ctx) {
   }
 
   function scheduleAnalysis(entry, llm, options) {
+    // Single-flight: abort any previous in-flight analysis for this session
+    // before starting a new one, instead of letting it run to completion
+    // wastefully in the background.
+    if (entry.abortController) {
+      try { entry.abortController.abort() } catch {}
+    }
+    const abortController = new AbortController()
+    entry.abortController = abortController
     entry.lastAnalyzedCount = options.messages.length
     entry.turnsSinceLastAnalysis = 0
     entry.generation += 1
     const myGeneration = entry.generation
     entry.status = 'analyzing'
-    runAnalysis(llm, options, entry.prompt1).then((result) => {
+
+    const timeout = setTimeout(() => {
+      try { abortController.abort() } catch {}
+    }, ANALYSIS_TIMEOUT_MS)
+
+    runAnalysis(llm, options, entry.prompt1, abortController.signal).then((result) => {
+      clearTimeout(timeout)
       if (myGeneration !== entry.generation) return
       entry.score = result.score
       entry.commentary = result.commentary
@@ -346,6 +433,7 @@ export function apply(ctx) {
         entry.pendingSteer = null
       }
     }).catch((error) => {
+      clearTimeout(timeout)
       console.error('[dsh-contradictions-indicator] analysis failed', error)
       if (myGeneration !== entry.generation) return
       entry.status = 'error'
@@ -360,6 +448,7 @@ export function apply(ctx) {
     try {
       if (decision.kind === 'reject') return decision
       if (payload.signal?.aborted) return decision
+      if (!decision.messages || !decision.messages.length) return decision
       const agent = payload.agent
       const sessionId = agent?.session?.id ?? agent?.id
       const entry = stateFor(sessionId)
@@ -369,6 +458,7 @@ export function apply(ctx) {
       const text = entry.pendingSteer
       entry.pendingSteer = null
       return {
+        ...decision,
         kind: 'enter',
         messages: [...decision.messages, makeSteerMessage(text, entry.score)],
       }
@@ -384,8 +474,14 @@ export function apply(ctx) {
       if (options.purpose !== undefined) return stream
       if (!options.messages || options.messages.length < MIN_MESSAGES) return stream
       const lastMsg = options.messages[options.messages.length - 1]
-      if (isOurAnalysisCall(lastMsg)) return stream
+      // Skip both our own analysis calls AND our own steer notices — a
+      // steer message is not a real conversational turn and must not
+      // advance the auto-analysis interval or get captured as lastOptions.
+      if (isOurAnalysisCall(lastMsg) || isOurSteerCall(lastMsg)) return stream
 
+      // Use options.sessionId as the single canonical session key
+      // everywhere (llm/stream, agent/pre-step, and HTTP all agree on this
+      // one source now instead of three different fallbacks).
       const entry = stateFor(options.sessionId)
       lastActiveKey = options.sessionId || entry.key
       if (entry.lastSeenCount === options.messages.length) return stream
@@ -405,69 +501,100 @@ export function apply(ctx) {
   })
 
   ctx.inject(['webServer'], (host) => {
-    host.webServer.register({
+    const disposers = []
+
+    disposers.push(host.webServer.register({
       kind: 'exact',
       path: '/contradictions/state',
       handler: (request, response) => {
-        if (request.method !== 'GET') { response.writeHead(405, { allow: 'GET' }); response.end(); return }
+        if (request.method !== 'GET') { sendMethodNotAllowed(response, 'GET'); return }
+        if (!isTrustedLocalRequest(request)) { response.writeHead(403); response.end(); return }
         sendJson(response, 200, snapshot(stateFor(sessionIdFrom(request))))
       },
-    })
+    }))
 
-    host.webServer.register({
+    disposers.push(host.webServer.register({
       kind: 'exact',
       path: '/contradictions/auto',
       handler: async (request, response) => {
-        if (request.method !== 'POST') { response.writeHead(405, { allow: 'POST' }); response.end(); return }
-        const body = await readBody(request)
-        const entry = stateFor(sessionIdFrom(request))
-        const persist = body?.persist === true
-        const nextGlobals = { ...globals }
+        if (request.method !== 'POST') { sendMethodNotAllowed(response, 'POST'); return }
+        if (!isTrustedLocalRequest(request)) { response.writeHead(403); response.end(); return }
+        try {
+          const body = await readBody(request)
+          if (body?.__tooLarge) { sendJson(response, 413, { error: 'body too large' }); return }
+          const entry = stateFor(sessionIdFrom(request))
+          const persist = body?.persist === true
+          const nextGlobals = { ...globals }
 
-        if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
-        if (typeof body?.steer === 'boolean') {
-          entry.steerEnabled = body.steer
-          if (!entry.steerEnabled) entry.pendingSteer = null
-          if (persist) nextGlobals.steerEnabled = body.steer
+          if (typeof body?.enabled === 'boolean') entry.autoEnabled = body.enabled
+          if (typeof body?.steer === 'boolean') {
+            entry.steerEnabled = body.steer
+            if (!entry.steerEnabled) entry.pendingSteer = null
+            if (persist) nextGlobals.steerEnabled = body.steer
+          }
+          if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
+            entry.interval = clampInterval(body.interval)
+            if (persist) nextGlobals.interval = entry.interval
+          }
+          if (typeof body?.prompt1 === 'string') {
+            entry.prompt1 = clampPrompt(body.prompt1, DEFAULT_PROMPT1)
+            if (persist) nextGlobals.prompt1 = entry.prompt1
+          }
+          if (typeof body?.prompt2 === 'string') {
+            entry.prompt2 = clampPrompt(body.prompt2, DEFAULT_PROMPT2)
+            if (persist) nextGlobals.prompt2 = entry.prompt2
+          }
+          if (persist) await persistGlobals(nextGlobals)
+          sendJson(response, 200, snapshot(entry))
+        } catch (error) {
+          console.error('[dsh-contradictions-indicator] /auto handler failed', error)
+          sendJson(response, 500, { error: 'internal error' })
         }
-        if (body?.interval !== undefined && body?.interval !== null && body?.interval !== '') {
-          entry.interval = clampInterval(body.interval)
-          if (persist) nextGlobals.interval = entry.interval
-        }
-        if (typeof body?.prompt1 === 'string') {
-          entry.prompt1 = body.prompt1.trim() ? body.prompt1 : DEFAULT_PROMPT1
-          if (persist) nextGlobals.prompt1 = entry.prompt1
-        }
-        if (typeof body?.prompt2 === 'string') {
-          entry.prompt2 = body.prompt2.trim() ? body.prompt2 : DEFAULT_PROMPT2
-          if (persist) nextGlobals.prompt2 = entry.prompt2
-        }
-        if (persist) await persistGlobals(nextGlobals)
-        sendJson(response, 200, snapshot(entry))
       },
-    })
+    }))
 
-    host.webServer.register({
+    disposers.push(host.webServer.register({
       kind: 'exact',
       path: '/contradictions/defaults',
       handler: async (request, response) => {
         if (request.method === 'GET') {
+          if (!isTrustedLocalRequest(request)) { response.writeHead(403); response.end(); return }
           sendJson(response, 200, { ...globals, defaults: defaults() })
           return
         }
-        if (request.method !== 'POST') { response.writeHead(405, { allow: 'GET, POST' }); response.end(); return }
-        const body = await readBody(request)
-        await persistGlobals({ ...globals, ...body })
-        sendJson(response, 200, { ...globals, defaults: defaults() })
+        if (request.method !== 'POST') { sendMethodNotAllowed(response, 'GET, POST'); return }
+        if (!isTrustedLocalRequest(request)) { response.writeHead(403); response.end(); return }
+        try {
+          const body = await readBody(request)
+          if (body?.__tooLarge) { sendJson(response, 413, { error: 'body too large' }); return }
+          // Whitelist known fields only; never spread an arbitrary body
+          // into persisted global state.
+          const { interval, steerEnabled, prompt1, prompt2 } = body || {}
+          await persistGlobals({
+            interval: interval !== undefined ? interval : globals.interval,
+            steerEnabled: steerEnabled !== undefined ? steerEnabled : globals.steerEnabled,
+            prompt1: prompt1 !== undefined ? prompt1 : globals.prompt1,
+            prompt2: prompt2 !== undefined ? prompt2 : globals.prompt2,
+          })
+          sendJson(response, 200, { ...globals, defaults: defaults() })
+        } catch (error) {
+          console.error('[dsh-contradictions-indicator] /defaults handler failed', error)
+          sendJson(response, 500, { error: 'internal error' })
+        }
       },
-    })
+    }))
 
-    host.webServer.register({
+    disposers.push(host.webServer.register({
       kind: 'exact',
       path: '/contradictions/trigger',
       handler: async (request, response) => {
-        if (request.method !== 'POST') { response.writeHead(405, { allow: 'POST' }); response.end(); return }
+        if (request.method !== 'POST') { sendMethodNotAllowed(response, 'POST'); return }
+        if (!isTrustedLocalRequest(request)) { response.writeHead(403); response.end(); return }
         const entry = stateFor(sessionIdFrom(request))
+        if (entry.status === 'analyzing') {
+          sendJson(response, 200, { triggered: false, reason: 'Analysis already in progress.' })
+          return
+        }
         if (!entry.lastOptions) {
           sendJson(response, 200, {
             triggered: false,
@@ -483,7 +610,22 @@ export function apply(ctx) {
         scheduleAnalysis(entry, llm, entry.lastOptions)
         sendJson(response, 200, { triggered: true, state: snapshot(entry) })
       },
-    })
+    }))
+
+    // Ensure all registered routes are unregistered, all in-flight analysis
+    // calls aborted, and shared state cleared when this fiber tears down
+    // (plugin stop/undefine/hot-reload).
+    ctx.effect(() => () => {
+      for (const dispose of disposers) {
+        try { if (typeof dispose === 'function') dispose() } catch {}
+      }
+      for (const entry of sessions.values()) {
+        if (entry.abortController) {
+          try { entry.abortController.abort() } catch {}
+        }
+      }
+      sessions.clear()
+    }, 'contradictions: webServer routes + session cleanup')
 
     console.log('[dsh-contradictions-indicator] host loaded')
   })
