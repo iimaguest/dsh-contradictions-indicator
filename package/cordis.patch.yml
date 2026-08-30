@@ -1,0 +1,7 @@
+# dsh-contradictions-indicator bundle patch — mount into the profile plugin
+# tree. The host half listens on the `llm/stream` waterfall and serves the
+# analysis state over an HTTP endpoint the client bundle polls.
+- insert:
+    - id: dsh-contradictions-indicator
+      name: dsh-contradictions-indicator
+      config: {}
