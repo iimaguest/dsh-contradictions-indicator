@@ -1,104 +1,55 @@
-# Contradictions Indicator — DSH Cordis Plugin
+# Contradictions Indicator
 
-A dynamic Cordis plugin for DSH Web that watches the running conversation,
-fires a parallel, KV-cache-friendly model call after each turn to analyze
-the conversation for internal contradictions, and shows the result as a
-small coherence-score badge (0% = very contradictory, 100% = smooth) plus
-a detailed commentary overlay.
+A DeepSeek Harness plugin that scores the live conversation for internal contradictions and shows a 0–100 coherence badge in the session header.
 
-## Status
+0 means the conversation is riddled with contradictions. 100 means it is consistent. Click the badge for commentary, a manual Analyze Now button, and per-session controls.
 
-Implemented and verified running in the DSH Web GUI as dynamic Cordis
-Plugin `contra-1`, current Package `pkg-3` (Host + Client combined).
+## Install
 
-Package history on `contra-1`:
-
-| Package | Host half | Client half | Outcome |
-|---|---|---|---|
-| `pkg-1` | ✅ | ✅ | Failed to activate: `slots.register` call was missing the required `name` field identifying the target slot. |
-| `pkg-2` | ❌ (omitted by mistake) | ✅ (fixed `name` field) | Activated successfully, but shipped **without** the analysis engine — the badge/overlay rendered with no data source. |
-| `pkg-3` | ✅ | ✅ | **Current.** Combines the working Host analysis engine with the fixed Client registration in one Package. Verified running: Host reports handler `get-analysis`; Client reports `running`. |
-
-The files in `plugin/host.js` and `plugin/client.js` in this repository are
-the exact source of `pkg-3`, kept here as the durable, version-controlled
-copy (dynamic Cordis Package definitions live only in the running DSH
-process and do not survive a process restart).
-
-## Architecture
-
-```
-Host (Node.js)
-  ctx.on('llm/stream', (options, next) => { ... })
-    - calls next() first, never blocks the main model call
-    - filters: skips options.purpose calls (compaction/session-title),
-      skips conversations under 4 messages, skips its own recursive
-      analysis calls (detected via the appended message's
-      source.plugin === 'contradictions-indicator'), debounces on
-      message count
-    - fires ctx.llm.stream() asynchronously with the IDENTICAL prefix
-      (provider, model, system, tools, sessionId, messages) plus one
-      appended user message instructing "do not use tools, analyze
-      contradictions" — preserving the provider's KV/prefix cache
-    - manually collects text-delta chunks (no BlockAssembler import
-      available in the dynamic-plugin sandbox)
-    - parses "SCORE: <n>" / "ANALYSIS: <text>" from the response
-    - exposes the latest result via harness.handle('get-analysis', ...)
-
-Client (Browser)
-  - polls host.call('get-analysis') every 3s (ctx.interval, inject: ['timer'])
-  - renders a colored score badge in
-    conversation.session.header.utilities (green ≥80%, yellow ≥50%,
-    red <50%, plus "Analyzing…" / "Analysis error" states)
-  - renders a click-to-expand overlay panel in shell.overlay with the
-    full score and commentary text
-  - styled with real DSH theme tokens (--dsw-alias-*) so it follows
-    light/dark mode
+```sh
+dsh plugin add https://github.com/iimaguest/dsh-contradictions-indicator
 ```
 
-See `IMPLEMENTATION_PLAN.md` for the full design rationale, the KV-cache
-strategy explanation, and the detailed DO/DON'T list used while building
-this.
+Restart or refresh `dsh web`. The badge appears in the conversation header utilities. Global defaults live under **Settings → Plugins → Contradictions**.
 
-## Files
+Requires DSH web with the settings and conversation UI packages that this plugin injects.
 
-- `plugin/host.js` — Host half source (Cordis dynamic Plugin function body)
-- `plugin/client.js` — Client half source (Cordis dynamic Plugin function body)
-- `link-peer-deps.sh` — links the `@deepseek-ai` peer packages into `package/node_modules` (see below)
-- `IMPLEMENTATION_PLAN.md` — original detailed implementation plan handed to the developer
+## What it does
 
-## Peer dependency links (required after a fresh clone)
+- Watches main conversation `llm/stream` calls (skips compaction, session-title, and its own analysis calls).
+- On demand, or on an opt-in interval, fires a parallel model call that reuses the conversation's provider, model, system prompt, tools, session id, and messages, then appends one analysis user message so the provider KV cache stays warm.
+- Parses `SCORE: <n>` and `ANALYSIS: <text>` from that response.
+- Shows a colored header badge (green ≥80, yellow ≥50, red &lt;50) and an overlay with the commentary.
+- Auto-analysis is off per session until you enable it. Default interval is 25 turns (editable, 1–500).
+- Optional next-turn system-reminder steer using `{{score}}` and `{{commentary}}`. Off for the analysis itself if you uncheck it.
+- Global interval, steer default, and both prompt texts persist via DSH settings (with a file fallback at `~/.dsh/contradictions-indicator.json`).
 
-The host half imports `@deepseek-ai/dsh-settings` and
-`@deepseek-ai/schemastery`. These are dsh host packages: the profile
-installs this plugin via a `link:` dependency pointing at `./package`, and
-Node resolves imports from the **real** path (symlinks are followed), so it
-never walks through the profile's `node_modules` where those packages live.
-Without a local link, `dsh web` fails with
-`Cannot find package '@deepseek-ai/dsh-settings' imported from
-.../package/lib/index.js`.
+## HTTP endpoints (local DSH web server)
 
-Fix (idempotent, `node_modules/` is gitignored so re-run after a fresh
-clone):
+The host half registers four exact paths on the DSH web server. They are meant for this plugin's client UI on the same origin:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/contradictions/state?sessionId=` | Current score, commentary, and session flags |
+| POST | `/contradictions/auto?sessionId=` | Update auto-analysis, interval, steer, prompts |
+| GET/POST | `/contradictions/defaults` | Read or write global defaults |
+| POST | `/contradictions/trigger?sessionId=` | Run analysis now |
+
+## Peer packages after a local clone
+
+If you `link:` this directory into a profile, Node resolves imports from the real path and will not see the profile's `@deepseek-ai` packages. Re-run after a fresh clone (`node_modules/` is gitignored):
 
 ```sh
 ./link-peer-deps.sh
 ```
 
-## Known limitations (v1, by design)
+## Layout
 
-- Analysis state is process-global, not per-session. With multiple
-  sessions open, the badge reflects whichever session's `llm/stream`
-  fired most recently.
-- Requires at least 4 messages in the conversation before the first
-  analysis triggers.
-- If the model provider is unavailable or the analysis call fails, the
-  badge shows an "Analysis error" state and does not retry automatically
-  until the next real conversation turn.
+- `lib/index.js` — host plugin (Cordis `apply`)
+- `lib/client.js` — web client (badge, overlay, settings tab)
+- `cordis.patch.yml` — bundle insert for `dsh plugin add`
+- `plugin/` — working copy of the same host/client sources
 
-## Reactivating after a process restart
+## License
 
-Dynamic Cordis Plugin definitions do not survive a DSH process restart.
-To reactivate, use `cordis_define` (with `plugin.kind: 'existing'` and
-`pluginId: 'contra-1'` if the plugin row still exists in this session, or
-`plugin.kind: 'new'` for a fresh plugin id) using the source in
-`plugin/host.js` and `plugin/client.js`, then `cordis_run`.
+Apache License 2.0. See `LICENSE`.
