@@ -63,6 +63,12 @@
     "@deepseek-ai/cordis": {
       "optional": true
     },
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
     "react": {
       "optional": true
     }
