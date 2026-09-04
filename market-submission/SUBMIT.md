@@ -21,8 +21,10 @@ CI requires the GitHub repo to be **at least 1 day old** and to have
       `market-submission/screenshots/` (per contributing.md: 1–8
       repo-relative paths, next to `package.json`; storefronts pick them up
       on the next nightly build — nothing to add to the PR itself)
-- [ ] Repo age ≥ 1 day
-- [ ] Open PR on awesome-dsh-plugin with **one** YAML file
+- [x] Repo age ≥ 1 day
+- [x] Open PR on awesome-dsh-plugin with **one** YAML file
+      → https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/4322
+      (opened 2026-09-04 from fork branch `add-dsh-contradictions-indicator`)
 
 ## Open the PR
 
