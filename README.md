@@ -22,7 +22,7 @@ dsh plugin --profile web remove dsh-contradictions-indicator
 
 `dsh plugin --profile web` forwards to pnpm in that profile directory (`add` / `update` / `remove`). After add or update, restart `dsh web` so the host and client halves load. The badge appears in the conversation header utilities. Global defaults live under **Settings → Plugins → Contradictions**.
 
-Requires DSH web with the settings and conversation UI packages that this plugin injects.
+Requires DSH web with the settings and conversation UI packages that this plugin injects. Tested against dsh 0.1.1-rc.2 and 0.1.2-rc.1.
 
 ## What it does
 

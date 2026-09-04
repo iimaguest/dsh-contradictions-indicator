@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+Compatibility release for dsh 0.1.2-rc.1.
+
+- Widen the optional `@deepseek-ai/dsh-settings` peer range to also cover the
+  `^0.1.2-rc.1` line that current dsh builds ship, so peer checks stay clean
+  on new hosts. No code changes: verified on 0.1.2-rc.1 that the host
+  `llm/stream` and `agent/pre-step` waterfalls and all four client injects
+  this plugin uses are unchanged, and the badge, panel, and locale keep
+  working.
+
 ## 1.2.0
 
 UI/UX and settings-semantics fixes from user feedback on the web client.
