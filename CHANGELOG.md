@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.3
+
+Full request parity for the analysis call.
+
+- The analysis request no longer forces a 20k output budget. `maxTokens` is
+  forwarded verbatim like every other declared field, so an absent budget stays
+  absent and the adapter default applies to both calls instead of only one.
+  That was the last field in which the analysis body could differ from the main
+  call; with it gone, the body is the main call plus exactly one appended
+  message, and only `signal` is deliberately replaced. A session configured
+  below 20k output tokens now gets that budget for its analysis too — a
+  truncated answer has no `SCORE:` field and is caught by the retry below.
+- Kept deliberately: the prompt-length clamp, the HTTP body-size guard, and the
+  50-session LRU cap. None of them can reach a model request — they bound a
+  setting string, a local route's body, and an in-memory table respectively —
+  so they cannot affect the cached prefix.
+- Tests updated: the analysis request is asserted to omit `maxTokens` when the
+  main call does, alongside the existing field-for-field parity case.
+
 ## 1.3.2
 
 Robust analysis responses, and no waking an idle conversation.

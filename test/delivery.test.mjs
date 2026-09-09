@@ -284,14 +284,16 @@ test('analysis request mirrors the main request field for field', async () => {
   assert.equal(appended.source.form, undefined)
 })
 
-test('analysis keeps a generous output budget when the main call declares none', async () => {
+test('analysis sends no output budget when the main call declares none', async () => {
   const harness = createHarness()
   apply(harness.ctx)
 
   reachInterval(harness)
   await waitFor(() => harness.analysisRequests.length > 0, 'the analysis request')
 
-  assert.equal(harness.analysisRequests[0].maxTokens, 20000)
+  // Parity: an absent maxTokens stays absent, so the adapter default applies
+  // to both calls instead of only to one of them.
+  assert.equal(harness.analysisRequests[0].maxTokens, undefined)
 })
 
 test('retries once when the model answers with a tool call and no text', async () => {
