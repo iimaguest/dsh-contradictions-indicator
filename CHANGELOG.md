@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.0
+
+Timely delivery of the coherence report, plus a load-breaking import fix.
+
+- **The system reminder is now pushed as soon as the report is ready.**
+  Previously the rendered notice was only handed to the conversation by the
+  `agent/pre-step` waterfall, which runs at the start of a step. A
+  conversation that went idle while the parallel analysis was still streaming
+  therefore stranded the reminder until the next manual user message — it
+  looked like the plugin only reacted when you typed something. The notice is
+  now submitted to the live agent's inbox with `agent.steer()` the moment the
+  analysis completes: an idle conversation opens a turn immediately, a running
+  one consumes it at its next step boundary. The pre-step path remains as a
+  fallback for when no live agent can be resolved (registry absent, session
+  closed, inbox rejection).
+- **Fixed a load failure on dsh-settings ≥ 0.1.1.** The host half imported
+  `installSettingsSection`/`settingsNamespace` by name; the newer line removed
+  those named exports in favour of `settings.installSection(owner, ns, …)`.
+  A missing named export fails at module-link time, so on such a host the
+  entire host half failed to load — no badge, no analysis, no steer. It now
+  uses a namespace import plus a shim that picks whichever API exists, and
+  degrades to the JSON settings file when neither is available.
+- The `agent/pre-step` fallback no longer creates per-session state for
+  unrelated agents (it only reads an existing entry), so stepping agents that
+  this plugin never analysed can no longer evict tracked sessions from the
+  state map.
+- Added host-side regression tests (`npm test`) covering immediate delivery to
+  an idle agent, the pre-step fallback, and the steer toggle being off.
+
 ## 1.2.1
 
 Compatibility release for dsh 0.1.2-rc.1.

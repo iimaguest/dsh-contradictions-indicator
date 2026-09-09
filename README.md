@@ -31,7 +31,7 @@ Requires DSH web with the settings and conversation UI packages that this plugin
 - Parses `SCORE: <n>` and `ANALYSIS: <text>` from that response.
 - Shows a colored header badge (green ≥80, yellow ≥50, red &lt;50) and an overlay with the commentary.
 - Auto-analysis is **on by default** for new conversations (default interval 25 turns, editable 1–500). Turn it off globally in Settings → Plugins → Contradictions, or per conversation in the panel.
-- Optional next-turn system-reminder steer using `{{score}}` and `{{commentary}}`. Injected on `agent/pre-step` (not by mutating frozen `llm/stream` options). Off for the analysis itself if you uncheck it.
+- Optional system-reminder steer using `{{score}}` and `{{commentary}}`. It is pushed into the conversation as a user message **the moment the analysis finishes** — `agent.steer()` on the live agent, which opens a turn when the conversation is idle and lands in the next step when it is busy. If no live agent can be resolved (registry absent, session closed, inbox rejection), the notice falls back to the `agent/pre-step` waterfall. Off entirely if you uncheck it.
 - The badge, panel, and settings tab are localized (English / 简体中文) through the shell's locale service, so **Settings → Language** applies to this plugin too, and every surface color/radius/shadow comes from the shell's `--dsw-*` theme tokens, so **Settings → Appearance** themes it like host UI.
 
 ### Settings: two planes, strictly separated
@@ -75,6 +75,19 @@ does **not** mean the plugin runs without them. `lib/index.js` hard-imports
 `@deepseek-ai/dsh-settings` and `@deepseek-ai/schemastery` and will fail to
 load if the profile does not provide them.
 
+The settings import is a namespace import on purpose, and the section is
+installed through a small shim: `dsh-settings` ≤ 0.1.0-rc.8 exports
+`installSettingsSection(ns, …)` with a validated namespace, while 0.1.1+
+exposes the same hook as `settings.installSection(owner, ns, …)` with a plain
+namespace string. A named import of the old symbol fails at module-link time
+on the newer line, which would take the whole host half down with it.
+
+Run the host-side regression tests with:
+
+```sh
+npm test
+```
+
 The `./client` export (`lib/client.js`) is a DSH `window.__ModuleLoader__`
 lazy-load factory, not a standard ESM/CJS module. It only runs inside the DSH
 browser runtime; `import … from 'dsh-contradictions-indicator/client'` will
@@ -85,6 +98,7 @@ not work outside of it.
 - `lib/index.js` — host plugin (Cordis `apply`)
 - `lib/client.js` — web client (badge, overlay, settings tab)
 - `cordis.patch.yml` — bundle insert for `dsh plugin add`
+- `test/` — host-side delivery-timing regression tests (`npm test`)
 - `plugin/` — working copy of the same host/client sources
 
 ## License

@@ -22,7 +22,15 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+// Namespace import on purpose. `@deepseek-ai/dsh-settings` dropped the
+// `installSettingsSection` / `settingsNamespace` named exports after
+// 0.1.0-rc.8 (0.1.1+ exposes the same hook as `settings.installSection()`
+// and plain string namespaces). A named import is resolved at module-link
+// time, so on such a host it threw a SyntaxError and the ENTIRE host half
+// failed to load — no badge, no analysis, no steer. A namespace import links
+// against whatever the host provides; `installSettingsSectionCompat()` below
+// picks the API that exists.
+import * as dshSettings from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 
 const MIN_MESSAGES = 4
@@ -226,8 +234,19 @@ function steerSummary(score) {
   return 'Coherence score ' + String(score) + '/100'
 }
 
+// Mirrors @deepseek-ai/dsh-llm's freezeMessage(): a message that enters the
+// durable log or an agent inbox must not be mutable afterwards. That package
+// is not a declared peer of this plugin, so the (tiny, stable) message shape
+// is built here instead of importing createUserMessage from it.
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value
+  Object.freeze(value)
+  for (const key of Object.keys(value)) deepFreeze(value[key])
+  return value
+}
+
 function makeSteerMessage(text, score) {
-  return {
+  return deepFreeze({
     id: newMessageId('contra-steer-'),
     role: 'user',
     content: [{ type: 'text', text }],
@@ -237,7 +256,28 @@ function makeSteerMessage(text, score) {
       form: 'notice',
       summary: steerSummary(score),
     },
+  })
+}
+
+/**
+ * Install the settings section against whichever settings API the host
+ * provides. dsh-settings <= 0.1.0-rc.8 exports `installSettingsSection`;
+ * 0.1.1+ exposes the identical hook as `settings.installSection(owner, ns,
+ * schema, entry, hooks)` and takes a plain namespace string.
+ *
+ * @returns whether a settings section was installed.
+ */
+function installSettingsSectionCompat(ctx, ns, schema, entry, hooks) {
+  if (typeof dshSettings.installSettingsSection === 'function') {
+    dshSettings.installSettingsSection(ctx, ns, schema, entry, hooks)
+    return true
   }
+  const settings = ctx.get('settings')
+  if (settings !== undefined && settings !== null && typeof settings.installSection === 'function') {
+    settings.installSection(ctx, ns, schema, entry, hooks)
+    return true
+  }
+  return false
 }
 
 function renderSteer(template, score, commentary) {
@@ -323,6 +363,41 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * Push a finished report into the conversation as a user message now.
+   *
+   * Delivery used to happen only in the `agent/pre-step` waterfall, which runs
+   * at the start of a step. A conversation that went idle while the parallel
+   * analysis was still streaming therefore stranded the reminder until the next
+   * manual user message — the "only after I type something" behaviour this
+   * fixes. The live agent's inbox is the correct seam: `steer()` submits the
+   * notice for the nearest step and wakes the driver, so an idle conversation
+   * opens a turn immediately and a running one consumes it at its next step
+   * boundary.
+   *
+   * An agent's id is its session id, which is what `llm/stream` receives as
+   * `options.sessionId`.
+   *
+   * @returns whether the notice was handed to a live agent.
+   */
+  function deliverSteer(entry) {
+    const text = entry.pendingSteer
+    if (!text) return false
+    const agents = ctx.get('agents')
+    if (agents === undefined || agents === null) return false
+    const agent = agents.get(entry.key)
+    if (agent === undefined || agent === null) return false
+    try {
+      agent.steer(makeSteerMessage(text, entry.score))
+      entry.pendingSteer = null
+      return true
+    } catch (error) {
+      // Leave the text pending so the pre-step fallback can still deliver it.
+      console.error('[dsh-contradictions-indicator] immediate steer delivery failed', error)
+      return false
+    }
+  }
+
   async function persistGlobals(next) {
     const resolved = normalizeGlobals(next)
     globals = resolved
@@ -358,19 +433,25 @@ export function apply(ctx) {
   const entry = defaults()
   let source = () => entry
   try {
-    installSettingsSection(ctx, settingsNamespace(SETTINGS_NS), ContraSettings, entry, {
+    const installed = installSettingsSectionCompat(ctx, SETTINGS_NS, ContraSettings, entry, {
       setSource: (current) => { source = current },
       onChange: () => { globals = normalizeGlobals(source()) },
     })
-    settingsScope = {
-      get: () => source(),
-      update: async (patch) => {
-        const settings = ctx.get('settings')
-        if (!settings) throw new Error('settings unavailable')
-        await settings.update(settingsNamespace(SETTINGS_NS), patch)
-      },
+    if (installed) {
+      settingsScope = {
+        get: () => source(),
+        update: async (patch) => {
+          const settings = ctx.get('settings')
+          if (!settings) throw new Error('settings unavailable')
+          await settings.update(SETTINGS_NS, patch)
+        },
+      }
+      globals = normalizeGlobals(source())
+    } else {
+      // No settings API on this host: fall back to the JSON file below, the
+      // same plane the section would have persisted through.
+      console.warn('[dsh-contradictions-indicator] settings service unavailable; using file fallback')
     }
-    globals = normalizeGlobals(source())
   } catch (error) {
     console.error('[dsh-contradictions-indicator] settings register failed', error)
     settingsScope = null
@@ -454,6 +535,9 @@ export function apply(ctx) {
       entry.messageCount = options.messages.length
       if (entry.steerEnabled) {
         entry.pendingSteer = renderSteer(entry.prompt2, result.score, result.commentary)
+        // Push it now. The pre-step waterfall below only runs when the
+        // conversation takes another step, which an idle one does not.
+        deliverSteer(entry)
       } else {
         entry.pendingSteer = null
       }
@@ -465,9 +549,13 @@ export function apply(ctx) {
     })
   }
 
-  // Next-turn steer must happen here. llm/stream options are already
+  // Fallback delivery. A live agent is normally reached directly by
+  // deliverSteer() the moment a report is ready; this path covers the window
+  // where no live agent could be resolved (registry absent, session closed, or
+  // the inbox rejected the message). llm/stream options are already
   // deep-frozen by the agent loop, so mutating options.messages is a no-op
-  // (TypeError on frozen arrays, swallowed by the old try/catch).
+  // (TypeError on frozen arrays, swallowed by the old try/catch) — the step's
+  // admitted messages are the only place a notice can still be appended.
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     try {
@@ -475,8 +563,12 @@ export function apply(ctx) {
       if (payload.signal?.aborted) return decision
       if (!decision.messages || !decision.messages.length) return decision
       const agent = payload.agent
-      const sessionId = agent?.session?.id ?? agent?.id
-      const entry = stateFor(sessionId)
+      // Look the entry up instead of creating one: this waterfall fires for
+      // every agent in the process, including sessions this plugin never
+      // analysed, and creating entries there would evict tracked sessions
+      // from the LRU map.
+      const entry = sessions.get(agent?.session?.id) ?? sessions.get(agent?.id)
+      if (entry === undefined) return decision
       if (!entry.pendingSteer || !entry.steerEnabled) return decision
       const last = decision.messages[decision.messages.length - 1]
       if (isOurAnalysisCall(last) || isOurSteerCall(last)) return decision
