@@ -27,7 +27,7 @@ Requires DSH web with the settings and conversation UI packages that this plugin
 ## What it does
 
 - Watches main conversation `llm/stream` calls (skips compaction, session-title, and its own analysis calls).
-- On demand, or on a turn interval, fires a parallel model call that reuses the conversation's provider, model, system prompt, tools, session id, and messages, then appends one analysis user message so the provider KV cache stays warm.
+- On demand, or on a turn interval, fires a parallel model call that reuses the conversation's provider, model, system prompt, tools, session id, and messages, then appends one analysis user message so the provider KV cache stays warm. Every other request field the session declared — reasoning effort, temperature, stop sequences, and the output budget — is forwarded verbatim too, so the only difference from the main call is the appended message. The output budget is never lowered below 20k tokens, since a truncated response wastes the whole call.
 - Parses `SCORE: <n>` and `ANALYSIS: <text>` from that response.
 - Shows a colored header badge (green ≥80, yellow ≥50, red &lt;50) and an overlay with the commentary.
 - Auto-analysis is **on by default** for new conversations (default interval 25 turns, editable 1–500). Turn it off globally in Settings → Plugins → Contradictions, or per conversation in the panel.

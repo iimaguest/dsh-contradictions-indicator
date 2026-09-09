@@ -88,7 +88,7 @@ function fakeAgent(status = 'idle') {
 }
 
 /** Drive one main-conversation request through the llm/stream waterfall. */
-function fireStream(harness, messageCount) {
+function fireStream(harness, messageCount, extra = {}) {
   const messages = []
   for (let i = 0; i < messageCount; i += 1) {
     messages.push({
@@ -98,15 +98,14 @@ function fireStream(harness, messageCount) {
       source: { kind: i % 2 === 0 ? 'user' : 'model' },
     })
   }
-  return harness.handlers.get('llm/stream')(
-    { sessionId: SESSION, provider: 'p', model: 'm', messages },
-    () => (async function* () {})(),
-  )
+  const options = { sessionId: SESSION, provider: 'p', model: 'm', messages, ...extra }
+  harness.lastMainOptions = options
+  return harness.handlers.get('llm/stream')(options, () => (async function* () {})())
 }
 
 /** Fire enough main requests to reach the default 25-step interval. */
-function reachInterval(harness, turns = 25) {
-  for (let i = 0; i < turns; i += 1) fireStream(harness, 4 + i)
+function reachInterval(harness, turns = 25, extra = {}) {
+  for (let i = 0; i < turns; i += 1) fireStream(harness, 4 + i, extra)
 }
 
 async function waitFor(predicate, label, timeoutMs = 3000) {
@@ -208,4 +207,54 @@ test('delivers nothing while the steer toggle is off', async () => {
   assert.equal(agent.steers.length, 0)
   assert.equal(agent.followups.length, 0)
   assert.equal(agent.injects.length, 0)
+})
+
+test('analysis request mirrors the main request field for field', async () => {
+  const harness = createHarness()
+  apply(harness.ctx)
+
+  const tools = [{ name: 't', description: 'd', parameters: { type: 'object' } }]
+  const extra = {
+    reasoningEffort: 'max',
+    temperature: 0.2,
+    stop: ['</done>'],
+    maxTokens: 32000,
+    system: 'you are a test',
+    tools,
+  }
+  reachInterval(harness, 25, extra)
+  await waitFor(() => harness.analysisRequests.length > 0, 'the analysis request')
+
+  const main = harness.lastMainOptions
+  const analysis = harness.analysisRequests[0]
+
+  // Every request field the session declared is forwarded verbatim, so the
+  // provider sees the same call parameters rather than adapter defaults.
+  assert.equal(analysis.provider, main.provider)
+  assert.equal(analysis.model, main.model)
+  assert.equal(analysis.reasoningEffort, main.reasoningEffort)
+  assert.equal(analysis.temperature, main.temperature)
+  assert.deepEqual(analysis.stop, main.stop)
+  assert.equal(analysis.maxTokens, main.maxTokens)
+  assert.equal(analysis.system, main.system)
+  assert.equal(analysis.sessionId, main.sessionId)
+  // Same tool array reference, not a copy: the cache key includes tools.
+  assert.equal(analysis.tools, tools)
+
+  // The prompt is the identical prefix plus exactly one appended message.
+  assert.equal(analysis.messages.length, main.messages.length + 1)
+  assert.deepEqual(analysis.messages.slice(0, main.messages.length), main.messages)
+  const appended = analysis.messages[analysis.messages.length - 1]
+  assert.equal(appended.source.plugin, 'contradictions-indicator')
+  assert.equal(appended.source.form, undefined)
+})
+
+test('analysis keeps a generous output budget when the main call declares none', async () => {
+  const harness = createHarness()
+  apply(harness.ctx)
+
+  reachInterval(harness)
+  await waitFor(() => harness.analysisRequests.length > 0, 'the analysis request')
+
+  assert.equal(harness.analysisRequests[0].maxTokens, 20000)
 })

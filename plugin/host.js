@@ -471,25 +471,31 @@ export function apply(ctx) {
     }
     const messages = originalOptions.messages.slice()
     messages.push(analysisMessage)
+    // Byte-parity with the main call. The provider's context cache is keyed on
+    // the prompt prefix, which is already identical: `messages` is the same
+    // array with one suffix message appended, and `system`/`tools` are the very
+    // same references. The remaining GenerateOptions fields are wire parameters
+    // rather than prompt tokens, but they are forwarded verbatim too, so the
+    // request body matches the call the session just made instead of silently
+    // substituting adapter defaults for the session's reasoning effort,
+    // temperature, and stop sequences.
     const analysisOptions = {
       provider: originalOptions.provider,
       model: originalOptions.model,
       messages,
-      maxTokens: MAX_TOKENS,
       signal,
     }
-    if (originalOptions.system !== undefined) analysisOptions.system = originalOptions.system
-    if (originalOptions.tools !== undefined) analysisOptions.tools = originalOptions.tools
-    if (originalOptions.sessionId !== undefined) analysisOptions.sessionId = originalOptions.sessionId
-    // `tools` is deliberately kept byte-identical to the original request:
-    // this call must be a pure suffix-append onto the exact same prefix
-    // (provider, model, system, tools, messages…) so the provider's KV
-    // cache is reused instead of invalidated — that's the whole point of
-    // firing this as a "parallel" analysis call instead of a fresh one.
-    // This is safe because runAnalysis() only ever reads `text-delta` and
-    // `finish` chunks from the raw llm.stream() below; it never dispatches
-    // to ctx.tools.execute(), so a tool-call chunk the model might emit
-    // here is simply ignored, never actually invoked.
+    for (const key of ['reasoningEffort', 'temperature', 'stop', 'system', 'tools', 'sessionId']) {
+      if (originalOptions[key] !== undefined) analysisOptions[key] = originalOptions[key]
+    }
+    // Output budget matches the main call whenever it declares one, and never
+    // drops below MAX_TOKENS: a truncated finish_reason ('length') before the
+    // model reaches 'ANALYSIS:' wastes the entire parallel call.
+    analysisOptions.maxTokens = Math.max(originalOptions.maxTokens ?? 0, MAX_TOKENS)
+    // Keeping `tools` byte-identical is safe because runAnalysis() only ever
+    // reads `text-delta` and `finish` chunks from the raw llm.stream() below;
+    // it never dispatches to ctx.tools.execute(), so a tool-call chunk the
+    // model might emit here is simply ignored, never actually invoked.
 
     let fullText = ''
     let sawError = null

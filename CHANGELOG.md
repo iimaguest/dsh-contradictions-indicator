@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.1
+
+Cache parity for the parallel analysis call.
+
+- The analysis request now mirrors the main call field for field. It already
+  reused the conversation's `provider`, `model`, `system`, `tools`, and
+  `messages` prefix, but it silently dropped `reasoningEffort`, `temperature`,
+  and `stop`, so the provider resolved adapter defaults instead of the
+  session's own settings. Those fields are forwarded verbatim now, and the
+  output budget follows the main call's `maxTokens` instead of always being
+  20k — never below 20k, since a truncated response wastes the whole call.
+  The request body is therefore identical to the call the session just made
+  apart from the single appended analysis message.
+- Measured on a live conversation: the analysis call was served 138,752
+  tokens from the provider's context cache against 16,152 fresh tokens
+  (~90% cached), while the main call of the same step read 154,496 cached
+  against 216 fresh.
+- Regression tests assert the field-for-field parity, the identical message
+  prefix plus exactly one appended message, and the 20k output floor.
+
 ## 1.3.0
 
 Timely delivery of the coherence report, plus a load-breaking import fix.
