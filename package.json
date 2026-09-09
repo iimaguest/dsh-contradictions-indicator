@@ -1,6 +1,6 @@
 {
   "name": "dsh-contradictions-indicator",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Parallel contradiction analysis for DSH conversations: a 0-100 coherence score badge with commentary, manual trigger, and auto-analysis on by default (interval editable, off per conversation or globally). Reuses the conversation's exact prefix so the provider KV cache stays warm.",
   "type": "module",
   "main": "lib/index.js",

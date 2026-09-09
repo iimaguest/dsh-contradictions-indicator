@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.4
+
+A clearer, partner-framed analysis prompt.
+
+- `DEFAULT_PROMPT1` no longer opens with a bare "Do NOT use tools" order. It
+  now starts with a short explanation of what the call is — a parallel,
+  detached review of the transcript above, whose only output is the written
+  assessment — and then explains why a tool call cannot help: it is not
+  executed, returns nothing, and leaves the check without its answer. The
+  text-only requirement is framed as asking a colleague for their read on the
+  discussion, followed by the same task list and `SCORE:`/`ANALYSIS:` format.
+- Note for existing installs: a prompt saved in settings (Settings →
+  Contradictions, or the per-conversation panel) still overrides this default.
+  Clear the field, or paste the new text, to pick it up; restarting alone does
+  not replace a saved value.
+
 ## 1.3.3
 
 Full request parity for the analysis call.
