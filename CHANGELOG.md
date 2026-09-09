@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.3.2
+
+Robust analysis responses, and no waking an idle conversation.
+
+- `analysis failed: analysis model call produced no text` is fixed. The request
+  carries the session's real tool list on purpose (it is part of the cached
+  prefix), so the model can ignore the prompt's "respond with text only"
+  instruction and answer with a bare tool call — zero text blocks, no `SCORE:`.
+  A response with no text, or without a `SCORE:` field, is now retried exactly
+  once before the run is reported as failed. The retry re-sends the identical
+  cached prefix, so it is nearly free; the tool list is never dropped to force
+  compliance, because removing it would invalidate the whole context cache.
+- A reminder is no longer pushed into an idle conversation. `agent.steer()`
+  wakes an idle agent, which opened a brand-new turn whose only content was the
+  notice. Delivery now happens only while a turn is running, at its next step
+  boundary; otherwise the text stays pending and the `agent/pre-step` fallback
+  hands it over when that conversation takes its next step. Nothing is dropped.
+- Failure messages are precise: `produced no text` vs `returned no SCORE field`,
+  after both attempts.
+- Tests: 9 cases, covering the running-turn push, the held idle notice, the
+  no-text retry, the off-format retry, and the terminal failure after one retry.
+
 ## 1.3.1
 
 Cache parity for the parallel analysis call.

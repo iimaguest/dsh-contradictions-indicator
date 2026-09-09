@@ -2,10 +2,11 @@
  * Delivery-timing regression tests for the host half.
  *
  * The bug these lock down: a finished report was only ever handed to the
- * conversation by the `agent/pre-step` waterfall, so an idle conversation
- * (no step until the user types again) stranded the system reminder. It must
- * now be pushed through the live agent's inbox the moment the analysis
- * completes.
+ * conversation by the `agent/pre-step` waterfall, so a conversation that was
+ * mid-turn while the analysis finished stranded the system reminder until the
+ * next manual user message. It is now pushed through the live agent's inbox as
+ * soon as the analysis completes, provided a turn is actually running — an
+ * idle conversation is never woken just to carry a notice.
  *
  * Run with: node --test test/
  */
@@ -23,8 +24,12 @@ function analysisText() {
 /**
  * Minimal Cordis-shaped context. Only the surface this plugin touches is
  * implemented: on(), get(), effect(), and inject(['webServer']).
+ *
+ * `script` optionally overrides the chunk sequence per analysis call; the last
+ * entry repeats, so a one-entry script models a model that always answers the
+ * same way.
  */
-function createHarness() {
+function createHarness(script = null) {
   const handlers = new Map()
   const routes = new Map()
   const agents = new Map()
@@ -33,9 +38,14 @@ function createHarness() {
   const llm = {
     stream(request) {
       analysisRequests.push(request)
+      const chunks = script === null ? null : script[Math.min(analysisRequests.length - 1, script.length - 1)]
       return (async function* () {
-        yield { type: 'text-delta', text: analysisText() }
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        if (chunks === null) {
+          yield { type: 'text-delta', text: analysisText() }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        for (const chunk of chunks) yield chunk
       })()
     },
   }
@@ -133,9 +143,9 @@ function readState(harness) {
   return body
 }
 
-test('pushes the report through the live agent as soon as it is ready', async () => {
+test('pushes the report through a running turn as soon as it is ready', async () => {
   const harness = createHarness()
-  const agent = fakeAgent('idle')
+  const agent = fakeAgent('running')
   harness.agents.set(SESSION, agent)
   apply(harness.ctx)
 
@@ -161,6 +171,31 @@ test('pushes the report through the live agent as soon as it is ready', async ()
     async () => ({ kind: 'enter', messages: [{ id: 'u1', role: 'user', content: [] }] }),
   )
   assert.equal(decision.messages.length, 1)
+})
+
+test('does not wake an idle conversation, holding the notice for its next step', async () => {
+  const harness = createHarness()
+  const agent = fakeAgent('idle')
+  harness.agents.set(SESSION, agent)
+  apply(harness.ctx)
+
+  reachInterval(harness)
+  await waitFor(() => readState(harness)?.status === 'ready', 'the analysis to finish')
+
+  // A reminder has no job while no turn is running, so steering would only
+  // open a brand-new turn whose sole content is the notice.
+  assert.equal(agent.steers.length, 0)
+  assert.equal(agent.followups.length, 0)
+  assert.equal(agent.injects.length, 0)
+
+  // It is not dropped: the next step of that conversation receives it.
+  const decision = await harness.handlers.get('agent/pre-step')(
+    { agent, signal: undefined },
+    async () => ({ kind: 'enter', messages: [{ id: 'u1', role: 'user', content: [] }] }),
+  )
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[1].source.plugin, 'contradictions-indicator')
+  assert.match(decision.messages[1].content[0].text, /91\/100/)
 })
 
 test('falls back to the step boundary when no live agent is registered', async () => {
@@ -257,4 +292,51 @@ test('analysis keeps a generous output budget when the main call declares none',
   await waitFor(() => harness.analysisRequests.length > 0, 'the analysis request')
 
   assert.equal(harness.analysisRequests[0].maxTokens, 20000)
+})
+
+test('retries once when the model answers with a tool call and no text', async () => {
+  const harness = createHarness([
+    [{ type: 'finish', reason: { kind: 'tool-calls' } }],
+    [
+      { type: 'text-delta', text: analysisText() },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ],
+  ])
+  apply(harness.ctx)
+
+  reachInterval(harness)
+  await waitFor(() => readState(harness)?.status === 'ready', 'the retried analysis')
+
+  assert.equal(harness.analysisRequests.length, 2)
+  assert.equal(readState(harness).score, 91)
+})
+
+test('retries once when the answer misses the required format', async () => {
+  const harness = createHarness([
+    [
+      { type: 'text-delta', text: 'I will look into that.' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ],
+    [
+      { type: 'text-delta', text: analysisText() },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ],
+  ])
+  apply(harness.ctx)
+
+  reachInterval(harness)
+  await waitFor(() => readState(harness)?.status === 'ready', 'the retried analysis')
+
+  assert.equal(harness.analysisRequests.length, 2)
+  assert.equal(readState(harness).score, 91)
+})
+
+test('reports a failure when both attempts come back with no text', async () => {
+  const harness = createHarness([[{ type: 'finish', reason: { kind: 'tool-calls' } }]])
+  apply(harness.ctx)
+
+  reachInterval(harness)
+  await waitFor(() => readState(harness)?.status === 'error', 'the reported failure')
+
+  assert.equal(harness.analysisRequests.length, 2)
 })
