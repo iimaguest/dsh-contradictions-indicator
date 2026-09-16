@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.4.0
+
+A rewritten default analysis prompt: three axes, a do-not-count list, and a
+short-output contract.
+
+- `DEFAULT_PROMPT1` no longer compares only sentences against sentences. The
+  checklist now works three axes: the task contract (original request plus
+  every amendment; the latest correction supersedes), the visible record (tool
+  output as ground truth — claimed passes over error exit codes, files
+  declared missing that were read, "verified" with no corresponding action),
+  and reasoning and position (plan/actions drift, circular progress,
+  evidence-free flips after pushback).
+- A do-not-count list keeps healthy evolution from tanking the score:
+  acknowledged changes of mind, meaning-preserving rewording, and conclusions
+  that changed with new evidence are explicitly not contradictions. The test
+  is silence, not change. This matters because the steer reminder fires every
+  interval: if healthy evolving conversations scored 60, the running agent
+  would learn to ignore it.
+- Scoring is anchored to consequence and silence — off-task drift or claims
+  the record contradicts belong well below 50 even with no formal
+  sentence-level contradiction; acknowledged evolution belongs in the 90s.
+- The analysis output is now capped: at most two paragraphs, lead with the
+  most consequential conflict, anchor it in the transcript, name the check
+  that would settle it; one plain sentence when nothing substantial is found.
+  Shorter output also reduces truncation-before-`SCORE:` risk. The
+  `SCORE:`/`ANALYSIS:` format contract is unchanged, so parsing and the
+  single retry are untouched.
+- The prompt opens with the jarring "Stop - WAIT." line to seize attention,
+  since the request arrives as a suffix user message on the cached prefix
+  mid-run, not as a fresh context.
+- Note for existing installs: a prompt saved in settings overrides this
+  default. This install's saved value was migrated through
+  `/contradictions/defaults` (which updates the live process and persists
+  through the settings service); other installs must clear the field or paste
+  the new text — restarting alone does not replace a saved value.
+
 ## 1.3.4
 
 A clearer, partner-framed analysis prompt.
