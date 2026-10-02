@@ -37,7 +37,7 @@ Requires DSH web with the settings and conversation UI packages that this plugin
 
 ### Settings: two planes, strictly separated
 
-Global defaults (`autoEnabled`, interval, steer, both prompt texts) live in **Settings → Plugins → Contradictions** and persist via DSH settings (with a file fallback at `~/.dsh/contradictions-indicator.json`). Each conversation snapshots those defaults **once, at creation**; after that the conversation's panel owns its own copy. Editing settings therefore affects **only conversations started afterwards** — it never reaches into a live one — and adjusting one conversation never writes back to the defaults (the old `persist` flag on `/contradictions/auto` is ignored and gone).
+Global defaults (`autoEnabled`, interval, steer, both prompt texts) live in the plugin's **Settings** section and persist through DSH's settings service into the profile patch (see "Settings in dsh 0.2 (native)" below). Each conversation snapshots those defaults **once, at creation**; after that the conversation's panel owns its own copy. Editing settings therefore affects **only conversations started afterwards** — it never reaches into a live one — and adjusting one conversation never writes back to the defaults (the old `persist` flag on `/contradictions/auto` is ignored and gone).
 
 ## HTTP endpoints (local DSH web server)
 
@@ -63,34 +63,18 @@ If you `link:` this directory into a profile, Node resolves imports from the rea
 ./link-peer-deps.sh
 ```
 
-Only `dsh-settings` and `schemastery` are linked — those are the only bare
-`import`s this plugin's host half actually executes in Node. `cordis` is a
-type-only import (used solely by `lib/types/index.d.ts`) and `react` is
-resolved through the DSH browser module table, not Node's `node_modules`, so
-neither needs linking here.
+`dsh-settings`, `schemastery`, and `cordis` are linked — the first two are
+bare `import`s the host half has always executed in Node, and since 2.0.0
+`cordis` is one too (the `Service` base class). `react` is resolved through
+the DSH browser module table, not Node's `node_modules`, so it needs no
+linking here.
 
-All four `peerDependencies` are marked `optional` in `package.json`. That is
-the correct *install* contract for a DSH host plugin — it tells pnpm these
-packages are provided by the profile, not duplicated by this package — but it
-does **not** mean the plugin runs without them. `lib/index.js` hard-imports
-`@deepseek-ai/dsh-settings` and `@deepseek-ai/schemastery` and will fail to
-load if the profile does not provide them.
-
-The settings import is a namespace import on purpose, and the section is
-installed through a small shim: `dsh-settings` ≤ 0.1.0-rc.8 exports
-`installSettingsSection(ns, …)` with a validated namespace, while 0.1.1+
-exposes the same hook as `settings.installSection(owner, ns, …)` with a plain
-namespace string. A named import of the old symbol fails at module-link time
-on the newer line, which would take the whole host half down with it.
-
-On dsh 0.2 the shim's third leg applies: 0.2 removed both helpers from the
-package exports and the settings service no longer offers `register` at all
-(namespaces derive from a plugin's Config schema there). `installSettingsSectionCompat`
-then returns false and the plugin runs its documented fallback — global
-defaults persist to `~/.dsh/contradictions-indicator.json`, while the
-in-app Settings tab keeps working through this plugin's own
-`/contradictions/*` endpoints. Nothing is registered with the host settings
-service on that line, so no stored 0.1-era namespace is read or rewritten.
+`@deepseek-ai/dsh-settings` and `react` are marked `optional` in
+`package.json` — the correct *install* contract for a DSH host plugin (pnpm
+must not duplicate host-provided packages) — while `cordis` and `schemastery`
+are required peers since 2.0.0 because the `Service` import is load-bearing.
+Optional never means "runs without them": `lib/index.js` hard-imports the
+peers it needs and will fail to load if the profile does not provide them.
 
 ### Message sources and the v4 session format
 
