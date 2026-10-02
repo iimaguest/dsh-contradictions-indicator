@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1
+
+Review follow-ups from #6. No behaviour change.
+
+- README no longer claims the plugin was tested on dsh 0.1.x. From 2.0.0 it
+  requires dsh 0.2.0-rc.1 or newer.
+- The Settings form's interval field now validates 1–500 at the schema, the
+  same bounds `clampInterval()` already enforced on every read and write.
+
 ## 2.0.0
 
 Native dsh 0.2 settings (issue #5). **Breaking: dsh 0.1 hosts are no longer
