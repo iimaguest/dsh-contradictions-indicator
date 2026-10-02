@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.1
+
+Compatibility with dsh 0.2.0-rc.2. No behaviour change on 0.1.x hosts.
+
+- The `@deepseek-ai/dsh-settings` peer range now also accepts the 0.2 line
+  (`|| ^0.2.0-rc.1`). This was the only peer the dsh startup compatibility
+  gate checks, so 1.4.0 was denied at profile startup on 0.2 — the badge
+  never mounted.
+- `@deepseek-ai/dsh-client-runtime` is dropped from `dsh.client.inject`. The
+  package no longer exists in 0.2 (split into the client store/connection
+  modules), and this plugin's client bundle is self-contained: it only asks
+  the module loader for `react`.
+- On a 0.2 host the settings section is not registered — 0.2 removed the
+  `installSettingsSection`/`settingsNamespace` helpers this plugin calls, and
+  the service no longer exposes `register` (namespaces now derive from a
+  plugin's Config schema). The existing compat chain falls back to
+  `~/.dsh/contradictions-indicator.json` with a one-line warn, and the
+  in-app settings tab keeps working through this plugin's own endpoints.
+  Migrating to the Config-schema model is future work, not a gate.
+
 ## 1.4.0
 
 A rewritten default analysis prompt: three axes, a do-not-count list, and a
