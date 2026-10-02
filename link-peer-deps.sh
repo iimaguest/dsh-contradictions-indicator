@@ -14,7 +14,7 @@
 set -e
 
 PEERS_ROOT="${DSH_PROFILE_PEERS:-$HOME/.dsh/profiles/node_modules/@deepseek-ai}"
-PEERS="dsh-settings schemastery"
+PEERS="dsh-settings schemastery cordis"
 
 for pkg in $PEERS; do
   if [ ! -d "$PEERS_ROOT/$pkg" ]; then

@@ -13,7 +13,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply } from '../lib/index.js'
+import ContradictionsIndicator from '../lib/index.js'
 
 const SESSION = 'session-test-1'
 
@@ -23,17 +23,31 @@ function analysisText() {
 
 /**
  * Minimal Cordis-shaped context. Only the surface this plugin touches is
- * implemented: on(), get(), effect(), and inject(['webServer']).
- *
- * `script` optionally overrides the chunk sequence per analysis call; the last
- * entry repeats, so a one-entry script models a model that always answers the
- * same way.
+ * implemented: on(), get(), effect(), inject(['webServer']), the fiber entry
+ * (the settings namespace), reflect.provide (the Service base registers the
+ * instance), a `settings` service capturing update() calls, and reactive
+ * config refs backed by mutable `configValues` (undefined defers to the
+ * shipped schema defaults, exactly like normalizeGlobals).
  */
 function createHarness(script = null) {
   const handlers = new Map()
   const routes = new Map()
   const agents = new Map()
   const analysisRequests = []
+  const settingsUpdates = []
+  const configValues = { autoEnabled: true, interval: 25, steerEnabled: true, prompt1: undefined, prompt2: undefined }
+  const config = {
+    autoEnabled: { get: () => configValues.autoEnabled },
+    interval: { get: () => configValues.interval },
+    steerEnabled: { get: () => configValues.steerEnabled },
+    prompt1: { get: () => configValues.prompt1 },
+    prompt2: { get: () => configValues.prompt2 },
+  }
+  const settings = {
+    updates: settingsUpdates,
+    async update(ns, values) { settingsUpdates.push({ ns, values }) },
+  }
+  const exposed = { settings }
 
   const llm = {
     stream(request) {
@@ -51,6 +65,8 @@ function createHarness(script = null) {
   }
 
   const ctx = {
+    fiber: { entry: { options: { id: 'contradictions-indicator-test' } } },
+    reflect: { provide() {} },
     on(name, handler) {
       handlers.set(name, handler)
       return () => handlers.delete(name)
@@ -58,6 +74,7 @@ function createHarness(script = null) {
     get(name) {
       if (name === 'llm') return llm
       if (name === 'agents') return { get: (id) => agents.get(id) }
+      if (name === 'settings') return exposed.settings
       return undefined
     },
     effect(fn) {
@@ -79,7 +96,7 @@ function createHarness(script = null) {
     },
   }
 
-  return { ctx, handlers, routes, agents, analysisRequests }
+  return { ctx, handlers, routes, agents, analysisRequests, settingsUpdates, configValues, config, exposed }
 }
 
 function fakeAgent(status = 'idle') {
@@ -127,12 +144,12 @@ async function waitFor(predicate, label, timeoutMs = 3000) {
   assert.fail('timed out waiting for ' + label)
 }
 
-function readState(harness) {
+function readState(harness, session = SESSION) {
   const handler = harness.routes.get('/contradictions/state')
   assert.ok(handler, 'state route registered')
   let body = null
   handler(
-    { method: 'GET', url: '/contradictions/state?sessionId=' + SESSION, headers: {} },
+    { method: 'GET', url: '/contradictions/state?sessionId=' + session, headers: {} },
     {
       headersSent: false,
       writableEnded: false,
@@ -147,7 +164,7 @@ test('pushes the report through a running turn as soon as it is ready', async ()
   const harness = createHarness()
   const agent = fakeAgent('running')
   harness.agents.set(SESSION, agent)
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => agent.steers.length > 0, 'an immediate steer delivery')
@@ -177,7 +194,7 @@ test('does not wake an idle conversation, holding the notice for its next step',
   const harness = createHarness()
   const agent = fakeAgent('idle')
   harness.agents.set(SESSION, agent)
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => readState(harness)?.status === 'ready', 'the analysis to finish')
@@ -200,7 +217,7 @@ test('does not wake an idle conversation, holding the notice for its next step',
 
 test('falls back to the step boundary when no live agent is registered', async () => {
   const harness = createHarness()
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => readState(harness)?.status === 'ready', 'the analysis to finish')
@@ -220,7 +237,7 @@ test('delivers nothing while the steer toggle is off', async () => {
   const harness = createHarness()
   const agent = fakeAgent('idle')
   harness.agents.set(SESSION, agent)
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   const auto = harness.routes.get('/contradictions/auto')
   await auto(
@@ -246,7 +263,7 @@ test('delivers nothing while the steer toggle is off', async () => {
 
 test('analysis request mirrors the main request field for field', async () => {
   const harness = createHarness()
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   const tools = [{ name: 't', description: 'd', parameters: { type: 'object' } }]
   const extra = {
@@ -286,7 +303,7 @@ test('analysis request mirrors the main request field for field', async () => {
 
 test('analysis sends no output budget when the main call declares none', async () => {
   const harness = createHarness()
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => harness.analysisRequests.length > 0, 'the analysis request')
@@ -304,7 +321,7 @@ test('retries once when the model answers with a tool call and no text', async (
       { type: 'finish', reason: { kind: 'stop' } },
     ],
   ])
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => readState(harness)?.status === 'ready', 'the retried analysis')
@@ -324,7 +341,7 @@ test('retries once when the answer misses the required format', async () => {
       { type: 'finish', reason: { kind: 'stop' } },
     ],
   ])
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => readState(harness)?.status === 'ready', 'the retried analysis')
@@ -335,7 +352,7 @@ test('retries once when the answer misses the required format', async () => {
 
 test('reports a failure when both attempts come back with no text', async () => {
   const harness = createHarness([[{ type: 'finish', reason: { kind: 'tool-calls' } }]])
-  apply(harness.ctx)
+  new ContradictionsIndicator(harness.ctx, harness.config)
 
   reachInterval(harness)
   await waitFor(() => readState(harness)?.status === 'error', 'the reported failure')
@@ -363,7 +380,7 @@ test('every emitted source passes the v4 producer-owned admission rule', async (
   const live = createHarness()
   const agent = fakeAgent('running')
   live.agents.set(SESSION, agent)
-  apply(live.ctx)
+  new ContradictionsIndicator(live.ctx, live.config)
   reachInterval(live)
   await waitFor(() => agent.steers.length > 0, 'the immediate steer delivery')
   assertV4Admissible(agent.steers[0])
@@ -376,7 +393,7 @@ test('every emitted source passes the v4 producer-owned admission rule', async (
   // Pre-step fallback path: the same constructor appends at the next step
   // of an idle conversation.
   const idle = createHarness()
-  apply(idle.ctx)
+  new ContradictionsIndicator(idle.ctx, idle.config)
   reachInterval(idle)
   await waitFor(() => readState(idle)?.status === 'ready', 'the analysis to finish')
   const decision = await idle.handlers.get('agent/pre-step')(
@@ -385,4 +402,75 @@ test('every emitted source passes the v4 producer-owned admission rule', async (
   )
   assert.equal(decision.messages.length, 2)
   assertV4Admissible(decision.messages[1])
+})
+
+test('seeds sessions from the composition config; volatile edits reach new sessions only', async () => {
+  const harness = createHarness()
+  new ContradictionsIndicator(harness.ctx, harness.config)
+
+  // First conversation snapshots the composition values at entry creation.
+  fireStream(harness, 4)
+  assert.equal(readState(harness).analysisInterval, 25)
+  assert.equal(readState(harness).autoEnabled, true)
+
+  // A volatile edit from the Settings form hot-applies to the composition —
+  // existing sessions keep their read-once snapshot; only sessions created
+  // afterwards pick the new values up (the documented two-planes semantics).
+  harness.configValues.interval = 10
+  harness.handlers.get('loader/volatile-update')()
+  assert.equal(readState(harness).analysisInterval, 25)
+
+  fireStream(harness, 5, { sessionId: 'session-test-2' })
+  assert.equal(readState(harness, 'session-test-2').analysisInterval, 10)
+})
+
+test('defaults POST writes through the settings service into the profile entry', async () => {
+  const harness = createHarness()
+  new ContradictionsIndicator(harness.ctx, harness.config)
+
+  const defaults = harness.routes.get('/contradictions/defaults')
+  assert.ok(defaults, 'defaults route registered')
+  await defaults(
+    {
+      method: 'POST',
+      url: '/contradictions/defaults',
+      headers: {},
+      on(event, handler) {
+        if (event === 'data') handler(Buffer.from(JSON.stringify({ interval: 40 })))
+        if (event === 'end') handler()
+      },
+    },
+    { headersSent: false, writableEnded: false, writeHead() { this.headersSent = true }, end() {} },
+  )
+
+  // One write-through, namespaced to this plugin's composed entry, carrying
+  // the full resolved globals — the same document the Settings form renders.
+  assert.equal(harness.settingsUpdates.length, 1)
+  assert.equal(harness.settingsUpdates[0].ns, 'contradictions-indicator-test')
+  assert.equal(harness.settingsUpdates[0].values.interval, 40)
+  assert.equal(harness.settingsUpdates[0].values.steerEnabled, true)
+  assert.equal(readState(harness).globals.interval, 40)
+})
+
+test('keeps globals in memory only when the host has no settings service', async () => {
+  const harness = createHarness()
+  harness.exposed.settings = undefined
+  new ContradictionsIndicator(harness.ctx, harness.config)
+
+  const defaults = harness.routes.get('/contradictions/defaults')
+  await defaults(
+    {
+      method: 'POST',
+      url: '/contradictions/defaults',
+      headers: {},
+      on(event, handler) {
+        if (event === 'data') handler(Buffer.from(JSON.stringify({ interval: 40 })))
+        if (event === 'end') handler()
+      },
+    },
+    { headersSent: false, writableEnded: false, writeHead() { this.headersSent = true }, end() {} },
+  )
+
+  assert.equal(harness.settingsUpdates.length, 0)
+  assert.equal(readState(harness).globals.interval, 40)
 })
