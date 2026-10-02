@@ -92,6 +92,16 @@ in-app Settings tab keeps working through this plugin's own
 `/contradictions/*` endpoints. Nothing is registered with the host settings
 service on that line, so no stored 0.1-era namespace is read or rewritten.
 
+### Message sources and the v4 session format
+
+Every durable message this plugin emits — the steer notice delivered to a
+running turn and the pre-step fallback insert — carries the producer-owned
+source kind `plugin:contradictions-indicator`. dsh's v4 session format
+refuses the retired v3 wrapper `kind: 'plugin'` at admission, and the refusal
+takes the whole running turn down with it, so the plugin must never emit it
+(a regression test locks this against the admission rule). The in-flight
+analysis request message uses the same kind; it is never persisted.
+
 Run the host-side regression tests with:
 
 ```sh

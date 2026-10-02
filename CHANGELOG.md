@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.2
+
+Fix the irrecoverable "format v4 message requires a producer-owned source
+kind" turn failure (issue #3).
+
+- The host half built every durable message source with the retired v3
+  wrapper shape `{ kind: 'plugin', plugin: 'contradictions-indicator' }`.
+  dsh's v4 session format refuses that shape at admission, and because the
+  steer notice is injected into a running turn, the admission throw failed
+  the whole turn — the tool call in flight was never persisted and the
+  conversation showed "This turn failed". This fired reliably on any
+  conversation where an auto-analysis completed mid-turn with steer enabled,
+  which is exactly what the 1.4.1 mount fix made reachable on 0.2 hosts.
+- Sources now carry the producer-owned kind `plugin:contradictions-indicator`
+  with the legacy `plugin` field dropped — the same shape the dsh v3→v4
+  migrator lifts old logs to. Verified against the real dsh v4 admission
+  code: the new shape is admitted, the old shape reproduces the failure.
+- `isOurAnalysisCall`/`isOurSteerCall` recognize both the current kind and
+  the retired in-flight wrapper, so self-detection (skipping our own analysis
+  and steer messages) keeps working across the transition.
+
 ## 1.4.1
 
 Compatibility with dsh 0.2.0-rc.2. No behaviour change on 0.1.x hosts.
