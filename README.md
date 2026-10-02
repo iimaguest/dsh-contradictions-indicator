@@ -22,7 +22,7 @@ dsh plugin --profile web remove dsh-contradictions-indicator
 
 `dsh plugin --profile web` forwards to pnpm in that profile directory (`add` / `update` / `remove`). After add or update, restart `dsh web` so the host and client halves load. The badge appears in the conversation header utilities. Global defaults live under **Settings → Plugins → Contradictions**.
 
-Requires DSH web with the settings and conversation UI packages that this plugin injects. Tested against dsh 0.1.1-rc.2 and 0.1.2-rc.1.
+Requires DSH web with the settings and conversation UI packages that this plugin injects. Tested against dsh 0.1.1-rc.2, 0.1.2-rc.1, and 0.2.0-rc.2.
 
 ## What it does
 
@@ -82,6 +82,15 @@ installed through a small shim: `dsh-settings` ≤ 0.1.0-rc.8 exports
 exposes the same hook as `settings.installSection(owner, ns, …)` with a plain
 namespace string. A named import of the old symbol fails at module-link time
 on the newer line, which would take the whole host half down with it.
+
+On dsh 0.2 the shim's third leg applies: 0.2 removed both helpers from the
+package exports and the settings service no longer offers `register` at all
+(namespaces derive from a plugin's Config schema there). `installSettingsSectionCompat`
+then returns false and the plugin runs its documented fallback — global
+defaults persist to `~/.dsh/contradictions-indicator.json`, while the
+in-app Settings tab keeps working through this plugin's own
+`/contradictions/*` endpoints. Nothing is registered with the host settings
+service on that line, so no stored 0.1-era namespace is read or rewritten.
 
 Run the host-side regression tests with:
 
