@@ -43,6 +43,10 @@ const DEFAULT_INTERVAL = 25
 const ANALYSIS_RETRIES = 1
 const ANALYSIS_TIMEOUT_MS = 120_000
 const PLUGIN_TAG = 'contradictions-indicator'
+// Producer-owned source kind for the dsh v4 session format. The retired v3
+// wrapper `kind: 'plugin'` is refused at durable admission — and the refusal
+// takes the whole running turn down with it (issue #3).
+const PLUGIN_SOURCE_KIND = 'plugin:' + PLUGIN_TAG
 const MAX_SESSIONS = 50
 const MAX_PROMPT_LENGTH = 20_000
 const MAX_BODY_BYTES = 1_000_000
@@ -292,16 +296,24 @@ function readBody(request) {
   })
 }
 
+// Recognizes our messages by source: the producer-owned v4 kind, plus the
+// retired v3 wrapper that can still exist in flight inside a host process
+// built before the fix (v4 admission refuses that shape, so it never
+// reaches the durable log — but the detectors must not misread it either).
+function sourceIsOurs(source, wantNotice) {
+  if (source === null || typeof source !== 'object') return false
+  const ours = source.kind === PLUGIN_SOURCE_KIND
+    || (source.kind === 'plugin' && source.plugin === PLUGIN_TAG)
+  if (!ours) return false
+  return wantNotice ? source.form === 'notice' : source.form !== 'notice'
+}
+
 function isOurAnalysisCall(lastMsg) {
-  return lastMsg?.source?.kind === 'plugin'
-    && lastMsg.source.plugin === PLUGIN_TAG
-    && lastMsg.source.form !== 'notice'
+  return sourceIsOurs(lastMsg?.source, false)
 }
 
 function isOurSteerCall(lastMsg) {
-  return lastMsg?.source?.kind === 'plugin'
-    && lastMsg.source.plugin === PLUGIN_TAG
-    && lastMsg.source.form === 'notice'
+  return sourceIsOurs(lastMsg?.source, true)
 }
 
 function newMessageId(prefix) {
@@ -335,8 +347,7 @@ function makeSteerMessage(text, score) {
     role: 'user',
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: PLUGIN_TAG,
+      kind: PLUGIN_SOURCE_KIND,
       form: 'notice',
       summary: steerSummary(score),
     },
@@ -555,7 +566,7 @@ export function apply(ctx) {
       id: newMessageId('contra-'),
       role: 'user',
       content: [{ type: 'text', text: prompt1 || DEFAULT_PROMPT1 }],
-      source: { kind: 'plugin', plugin: PLUGIN_TAG },
+      source: { kind: PLUGIN_SOURCE_KIND },
     }
     const messages = originalOptions.messages.slice()
     messages.push(analysisMessage)

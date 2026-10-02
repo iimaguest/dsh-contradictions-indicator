@@ -158,8 +158,8 @@ test('pushes the report through a running turn as soon as it is ready', async ()
 
   const message = agent.steers[0]
   assert.equal(message.role, 'user')
-  assert.equal(message.source.kind, 'plugin')
-  assert.equal(message.source.plugin, 'contradictions-indicator')
+  assert.equal(message.source.kind, 'plugin:contradictions-indicator')
+  assert.equal(message.source.plugin, undefined)
   assert.equal(message.source.form, 'notice')
   assert.match(message.content[0].text, /91\/100/)
   assert.match(message.content[0].text, /retry budget/)
@@ -194,7 +194,7 @@ test('does not wake an idle conversation, holding the notice for its next step',
     async () => ({ kind: 'enter', messages: [{ id: 'u1', role: 'user', content: [] }] }),
   )
   assert.equal(decision.messages.length, 2)
-  assert.equal(decision.messages[1].source.plugin, 'contradictions-indicator')
+  assert.equal(decision.messages[1].source.kind, 'plugin:contradictions-indicator')
   assert.match(decision.messages[1].content[0].text, /91\/100/)
 })
 
@@ -212,7 +212,7 @@ test('falls back to the step boundary when no live agent is registered', async (
   )
 
   assert.equal(decision.messages.length, 2)
-  assert.equal(decision.messages[1].source.plugin, 'contradictions-indicator')
+  assert.equal(decision.messages[1].source.kind, 'plugin:contradictions-indicator')
   assert.match(decision.messages[1].content[0].text, /91\/100/)
 })
 
@@ -280,7 +280,7 @@ test('analysis request mirrors the main request field for field', async () => {
   assert.equal(analysis.messages.length, main.messages.length + 1)
   assert.deepEqual(analysis.messages.slice(0, main.messages.length), main.messages)
   const appended = analysis.messages[analysis.messages.length - 1]
-  assert.equal(appended.source.plugin, 'contradictions-indicator')
+  assert.equal(appended.source.kind, 'plugin:contradictions-indicator')
   assert.equal(appended.source.form, undefined)
 })
 
@@ -341,4 +341,48 @@ test('reports a failure when both attempts come back with no text', async () => 
   await waitFor(() => readState(harness)?.status === 'error', 'the reported failure')
 
   assert.equal(harness.analysisRequests.length, 2)
+})
+
+test('every emitted source passes the v4 producer-owned admission rule', async () => {
+  // The dsh v4 session format refuses retired plugin wrappers at admission,
+  // and the refusal takes the whole running turn down with it: "format v4
+  // message requires a producer-owned source kind". Any message this plugin
+  // hands to a durable log or a running turn must already carry the
+  // producer-owned kind (issue #3).
+  const assertV4Admissible = (message) => {
+    const source = message?.source
+    assert.ok(source !== null && typeof source === 'object', 'source is an object')
+    assert.equal(typeof source.kind, 'string', 'source.kind is a string')
+    assert.ok(source.kind.length > 0, 'source.kind is nonempty')
+    assert.notEqual(source.kind, 'plugin', 'the retired wrapper kind must never be emitted')
+    assert.equal(source.plugin, undefined, 'the legacy plugin field is dropped')
+    assert.equal(source.kind, 'plugin:contradictions-indicator')
+  }
+
+  // Immediate steer path: the notice enters a running turn's durable inbox.
+  const live = createHarness()
+  const agent = fakeAgent('running')
+  live.agents.set(SESSION, agent)
+  apply(live.ctx)
+  reachInterval(live)
+  await waitFor(() => agent.steers.length > 0, 'the immediate steer delivery')
+  assertV4Admissible(agent.steers[0])
+
+  // In-flight analysis message: never persisted, but it feeds the same
+  // self-detection and must stay on the producer-owned kind.
+  const analysis = live.analysisRequests[0]
+  assertV4Admissible(analysis.messages[analysis.messages.length - 1])
+
+  // Pre-step fallback path: the same constructor appends at the next step
+  // of an idle conversation.
+  const idle = createHarness()
+  apply(idle.ctx)
+  reachInterval(idle)
+  await waitFor(() => readState(idle)?.status === 'ready', 'the analysis to finish')
+  const decision = await idle.handlers.get('agent/pre-step')(
+    { agent: fakeAgent('idle'), signal: undefined },
+    async () => ({ kind: 'enter', messages: [{ id: 'u1', role: 'user', content: [] }] }),
+  )
+  assert.equal(decision.messages.length, 2)
+  assertV4Admissible(decision.messages[1])
 })
