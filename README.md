@@ -102,6 +102,22 @@ takes the whole running turn down with it, so the plugin must never emit it
 (a regression test locks this against the admission rule). The in-flight
 analysis request message uses the same kind; it is never persisted.
 
+### Settings in dsh 0.2 (native)
+
+From 2.0.0 the host half is a Cordis `Service` with a `static Config` schema
+covering the five global defaults (`autoEnabled`, `interval`, `steerEnabled`,
+`prompt1`, `prompt2`). dsh's settings service auto-generates a Settings tab
+form for the plugin's composed entry from that schema, edits persist into the
+profile patch through `settings.update`, and every field is `volatile` — an
+edit hot-applies via `loader/volatile-update` without remounting the plugin.
+Per-session entries snapshot these defaults once, at creation (Settings edits
+reach conversations started afterwards, never mid-flight ones). The plugin
+panel's global plane (`POST /contradictions/defaults`) writes through the same
+service, so the panel and the native form cannot drift apart. On a host with
+no settings service or no composed entry, global writes stay in memory with a
+console note; dsh 0.1 hosts are not supported at all (peers narrowed to
+`@deepseek-ai/dsh-settings ^0.2.0-rc.1`).
+
 Run the host-side regression tests with:
 
 ```sh

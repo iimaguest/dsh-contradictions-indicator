@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.0.0
+
+Native dsh 0.2 settings (issue #5). **Breaking: dsh 0.1 hosts are no longer
+supported.**
+
+- The host half is now a Cordis `Service` with a `static Config` schema
+  (`autoEnabled`, `interval`, `steerEnabled`, `prompt1`, `prompt2`). The
+  Settings tab auto-generates a form for the plugin's composed entry from that
+  schema — no custom UI needed — and edits persist into the profile patch
+  through the settings service.
+- All five fields are `volatile`: an edit from the Settings form hot-applies
+  through `loader/volatile-update` without remounting the plugin. Per-session
+  entries keep their documented read-once semantics — a snapshot is taken when
+  the session's entry is first created, and later default edits reach only
+  conversations started afterwards.
+- `/contradictions/defaults` (the plugin panel's global plane) writes through
+  `settings.update(entryId, …)`, so the panel and the native Settings form
+  always agree. Without a settings service or composed entry, writes stay
+  in memory with a console note.
+- Removed: the 0.1 `installSettingsSection`/`installSection` compat chain, the
+  `~/.dsh/contradictions-indicator.json` file fallback, and the
+  "settings service unavailable" fallback warning. Peers narrowed to
+  `@deepseek-ai/dsh-settings ^0.2.0-rc.1`; `@deepseek-ai/cordis` and
+  `@deepseek-ai/schemastery` are now required peers (the Service import is
+  load-bearing).
+
 ## 1.4.2
 
 Fix the irrecoverable "format v4 message requires a producer-owned source
