@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.1.0
+
+Expanded default analysis prompt (`DEFAULT_PROMPT1`). The `SCORE:`/`ANALYSIS:`
+format contract is unchanged, so parsing and the single retry are untouched.
+
+- Task contract: only the user can set or amend it. New checks for scope creep
+  (out-of-scope files, unrequested refactors, destructive actions without
+  asking, refusals worked around) and for instructions taken from the wrong
+  source (tool output, web pages, file contents, subagent replies).
+- Visible record: new check for stale beliefs — claims true when observed but
+  invalidated by later steps.
+- Reasoning: new check for confidence that does not match the evidence, in
+  either direction.
+- New section 4, delegated and background work: mis-relayed subagent/job
+  results, unverified subagent claims passed on as fact, uncollected jobs, and
+  delegated work that conflicts with the contract.
+- Matching do-not-count exclusions for each new area, and scoring guidance for
+  scope creep, planted instructions, stale beliefs, and delegated results.
+- Analysis may run to three paragraphs; the third names the likely next
+  failure.
+- The no-tool-calls rule is now stated firmly at the top, in the output
+  instructions ("Name the check; do not perform it"), and as a closing
+  reminder.
+- Note for existing installs: a prompt saved in settings overrides this
+  default; clear the field or paste the new text to pick it up.
+
 ## 2.0.1
 
 Review follow-ups from #6. No behaviour change.
